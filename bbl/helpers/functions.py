@@ -104,6 +104,7 @@ def fetch_exchange_rate(currency_code):
     
     # Fetch XML content from the URL
     response = requests.get(url)
+    logging.error(url)
     
     if response.status_code == 200:
         # Parse XML content
@@ -112,6 +113,7 @@ def fetch_exchange_rate(currency_code):
         # Find the currency block that matches the currency code
         for rate in root.findall("douaneMaandwisselkoers"):
             code = rate.find("muntCode").text
+            
             if code == currency_code:
                 foreign_rate = rate.find("tariefInVreemdeValuta").text
                 return foreign_rate
@@ -121,7 +123,7 @@ def fetch_exchange_rate(currency_code):
 def calculationVATndFREIGHT(price, freightUSD, vat1, vat2):
     # Example usage
     currency = 'USD'  # Replace with the desired currency code
-    EXCHANGE_RATE = safe_float_conversion(fetch_exchange_rate(currency))
+    EXCHANGE_RATE = 1.1739#safe_float_conversion(fetch_exchange_rate(currency))
 
     # First value in freightUSD array is in USD, convert to EUR
     freight_in_usd = freightUSD[0] if len(freightUSD) > 0 else 0
