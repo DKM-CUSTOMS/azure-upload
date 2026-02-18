@@ -1,5 +1,5 @@
-from StoreProjectOnOdoo.odoo.client import OdooClient
-from StoreProjectOnOdoo.config import Config
+from OdooService.odoo.client import OdooClient
+from OdooService.config import Config
 import logging
 
 logging.basicConfig(level=logging.INFO)

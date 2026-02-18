@@ -81,7 +81,7 @@ class ProjectContext:
     project_type: ProjectType
     tags: List[str] = field(default_factory=list)
     data_sources: List[DataSource] = field(default_factory=list)
-    priority: Priority = Priority.NORMAL
+    priority: Priority = Priority.MEDIUM
     
     @property
     def task_name(self) -> str:

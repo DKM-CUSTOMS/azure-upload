@@ -22,3 +22,4 @@ xlrd==1.2.0
 mistralai==1.7.0
 pyarrow
 pinecone==8.0.0
+selenium==4.27.1

@@ -1,0 +1,20 @@
+{
+    "Table1": [
+        {
+            "DOSSNR_ID": 80188,
+            "REFERENCE": "CU/01/2602000039",
+            "ADDR_SHIPPER": " ",
+            "ADDR_CONSIGEE": "SOUDAL",
+            "BL_NR": " ",
+            "DERIVED_DIRECTION": "IMPORT"
+        },
+        {
+            "DOSSNR_ID": 80010,
+            "REFERENCE": "CU/01/2602000003",
+            "ADDR_SHIPPER": " ",
+            "ADDR_CONSIGEE": " ",
+            "BL_NR": "export 02/2026",
+            "DERIVED_DIRECTION": "EXPORT"
+        }
+    ]
+}

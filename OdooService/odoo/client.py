@@ -149,7 +149,8 @@ class OdooClient:
         model: str, 
         domain: List, 
         fields: Optional[List[str]] = None,
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
+        order: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Search and read in one call.
@@ -159,6 +160,7 @@ class OdooClient:
             domain: Search domain
             fields: Optional fields to read
             limit: Optional max records
+            order: Optional sort order
             
         Returns:
             List of record dictionaries
@@ -170,6 +172,8 @@ class OdooClient:
             kwargs['fields'] = fields
         if limit:
             kwargs['limit'] = limit
+        if order:
+            kwargs['order'] = order
         
         return self.models.execute_kw(
             self.db, self.uid, self.api_key,
