@@ -10,6 +10,54 @@ from global_db.countries.functions import get_abbreviation_by_country
 from eternit.functions.functions import add_pieces_to_hs_and_totals, clean_customs_code, clean_incoterm, clean_number_from_chars, extract_and_clean, extract_customs_code, extract_data, merge_json_objects, normalize_numbers, safe_float_conversion, safe_int_conversion
 from eternit.excel.create_excel import write_to_excel
 
+def fall_back(table_data):
+    """Extract and log minimal data from customs tariff table"""
+    try:
+        simplified = []
+        current_row = {}
+        
+        for cell in table_data.get("cells", []):
+            row_idx = cell.get("rowIndex")
+            content = cell.get("content", "")
+            
+            if row_idx == 0:  # Skip header row
+                continue
+                
+            if row_idx not in [r["row"] for r in simplified if "row" in r]:
+                current_row = {"row": row_idx}
+                simplified.append(current_row)
+            
+            # Log to see column mapping
+            col_idx = cell.get("columnIndex")
+            logging.error(f"Row {row_idx}, Col {col_idx}: {content}")
+            
+            # Map column indices to fields based on your data
+            if col_idx == 0:
+                # Column 0: Contains both C.T and customs_tariff (e.g., "01 68118200")
+                if " " in content:
+                    parts = content.split(" ", 1)
+                    current_row["C.T"] = parts[0]
+                    current_row["customs_tariff"] = parts[1]
+                else:
+                    current_row["C.T"] = content
+            elif col_idx == 1:
+                # Column 1: Gross Weight (without KG)
+                current_row["gross_weight"] = content
+            elif col_idx == 2:
+                # Column 2: Net Weight (with KG)
+                current_row["nett_weight"] = content
+            elif col_idx == 3:
+                # Column 3: Net Value
+                current_row["net_value"] = content
+        
+        logging.error("=== FALLBACK TABLE DATA ===")
+        logging.error(json.dumps(simplified, indent=2))
+        return simplified
+        
+    except Exception as e:
+        logging.error(f"Fallback function error: {e}")
+        return []
+
 def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Processing file upload request.')
 
@@ -18,6 +66,29 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         req_body = req.get_json()
         files = req_body.get("files", "")
         email = req_body.get("body", "")
+
+        fallback_data = []  # Changed to list to collect all fallback data
+        
+        # Find and store all fallback table data
+        if files:
+            for file_idx, file in enumerate(files):
+                if "tables" in file:
+                    for table in file["tables"]:
+                        table_str = json.dumps(table)
+                        if '"content": "Customs tariff"' in table_str:
+                            table_data = fall_back(table)
+                            if table_data:  # Only add if not None/empty
+                                fallback_data.extend(table_data)  # Add to list instead of overwrite
+                
+                if "documents" in file:
+                    for doc in file["documents"]:
+                        if "tables" in doc:
+                            for table in doc["tables"]:
+                                table_str = json.dumps(table)
+                                if '"content": "Customs tariff"' in table_str:
+                                    table_data = fall_back(table)
+                                    if table_data:  # Only add if not None/empty
+                                        fallback_data.extend(table_data)  # Add to list instead of overwrite
 
         resutls = []
         
@@ -53,7 +124,53 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     else :
                         result[key] = value.get("content")      
 
-            '''------------------   Clean the JSON response   ------------------ '''       
+            '''------------------   Clean the JSON response   ------------------ '''
+            # Log original summary before fallback
+            logging.error("=== SUMMARY BEFORE FALLBACK ===")
+            logging.error(json.dumps(result.get("Summary"), indent=2))
+            
+            # Check if Summary has any missing or invalid values, use fallback data
+            if fallback_data and (not result.get("Summary") or 
+                any(
+                    item.get("HS") in [None, "", 0] or
+                    item.get("Gross Weight") in [None, "", 0] or
+                    item.get("Net Weight") in [None, "", 0] or
+                    item.get("Value") in [None, "", 0]
+                    for item in result.get("Summary", [])
+                )):
+                
+                logging.error("=== USING FALLBACK DATA FOR SUMMARY (missing/invalid fields) ===")
+                
+                # Create a dictionary of fallback items keyed by C.T + HS to avoid duplicates
+                fallback_dict = {}
+                for item in fallback_data:
+                    key = f"{item.get('C.T', '')}_{item.get('customs_tariff', '')}"
+                    
+                    # Clean the weights by removing "KG" if present
+                    gross_weight = item.get("gross_weight", "0").replace(" KG", "").strip()
+                    nett_weight = item.get("nett_weight", "0").replace(" KG", "").strip()
+                    net_value = item.get("net_value", "0").strip()
+                    
+                    # Normalize the numbers (convert European format to proper number string)
+                    gross_weight = normalize_numbers(gross_weight)
+                    nett_weight = normalize_numbers(nett_weight)
+                    net_value = normalize_numbers(net_value)
+                    
+                    fallback_dict[key] = {
+                        "C.T": item.get("C.T", ""),
+                        "HS": item.get("customs_tariff", ""),
+                        "Gross Weight": safe_float_conversion(gross_weight),
+                        "Net Weight": safe_float_conversion(nett_weight),
+                        "Value": safe_float_conversion(net_value)
+                    }
+                
+                # Convert back to list
+                result["Summary"] = list(fallback_dict.values())
+                
+                # Log summary after fallback
+                logging.error("=== SUMMARY AFTER FALLBACK ===")
+                logging.error(json.dumps(result.get("Summary"), indent=2))
+
             #clean and split the incoterm
             result["Incoterm"] = clean_incoterm(result.get("Incoterm", ""))
             first_twoChars = result.get("Reference", "")[:2]
@@ -174,20 +291,29 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             TotalNetWeight = 0
             for summary in summaries :
                 #handle the value
-                Price = summary.get("Value", "")
-                Price = normalize_numbers(Price)
+                Price = summary.get("Value")
+                if Price is None:
+                    Price = ""
+                elif isinstance(Price, str):
+                    Price = normalize_numbers(Price)
                 Price = safe_float_conversion(Price)
                 summary["Value"] = Price
                 
                 #handle the value
-                GrossWeight = summary.get("Gross Weight", "")
-                GrossWeight = normalize_numbers(GrossWeight)
+                GrossWeight = summary.get("Gross Weight")
+                if GrossWeight is None:
+                    GrossWeight = ""
+                elif isinstance(GrossWeight, str):
+                    GrossWeight = normalize_numbers(GrossWeight)
                 GrossWeight = safe_float_conversion(GrossWeight)
                 summary["Gross Weight"] = GrossWeight
                 
                 #handle the value
-                NetWeight = summary.get("Net Weight", "")
-                NetWeight = normalize_numbers(NetWeight)
+                NetWeight = summary.get("Net Weight")
+                if NetWeight is None:
+                    NetWeight = ""
+                elif isinstance(NetWeight, str):
+                    NetWeight = normalize_numbers(NetWeight)
                 NetWeight = safe_float_conversion(NetWeight)
                 TotalNetWeight += NetWeight
                 summary["Net Weight"] = NetWeight
@@ -198,6 +324,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         # Merge JSON objects
         merged_result = merge_json_objects(resutls)
         
+
         '''------------------   Extract data from the email   ------------------ '''    
         #Extract the body data
         cleaned_email_body_html = extract_and_clean(email)
@@ -232,20 +359,21 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         merged_result["Total pallets"] = result.get("collis", 0)
         merged_result["Freight"] = result.get("freight_cost", 0.0)
         
-        logging.error(json.dumps(merged_result.get("Summary"), indent=4))
-        
         if merged_result.get("Summary", ""):
             # Extract and clean Customs Tariff Codes in Summary
             for item in merged_result.get("Summary", []):
-                if item["HS"] is None:
+                if item.get("HS") is None:
                     item["HS"] = ""
         
-        if len(merged_result.get("Summary")) > 1:
+        if len(merged_result.get("Summary", [])) > 1:
             # Sort items by Customs Tariff Code
             sorted_items = sorted(merged_result.get("Summary"), key=lambda x: x.get("HS", ""))
-
-            # Replace the original list with the sorted one
             merged_result["Summary"] = sorted_items  
+        
+        # Log final summary
+        logging.error("=== FINAL SUMMARY ===")
+        logging.error(json.dumps(merged_result.get("Summary"), indent=2))
+        
         try:
             # Get the ILS number
             response = call_logic_app("ETERNIT")
