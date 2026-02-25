@@ -437,15 +437,6 @@ def build_index(req: func.HttpRequest) -> func.HttpResponse:
         first_seen = group["HISTORYDATETIME"].min().date().isoformat()
         last_seen = group["HISTORYDATETIME"].max().date().isoformat()
 
-        # Determine team from TYPEDECLARATIONSSW
-        type_val = str(group["TYPEDECLARATIONSSW"].iloc[0]).upper() if "TYPEDECLARATIONSSW" in group.columns else ""
-        if type_val in ("DMS_IMPORT", "IDMS_IMPORT"):
-            team = "import"
-        elif type_val in ("DMS_EXPORT", "IDMS_EXPORT"):
-            team = "export"
-        else:
-            team = "import"  # default
-
         company = str(group["ACTIVECOMPANY"].iloc[0]) if "ACTIVECOMPANY" in group.columns else ""
         principal = str(group[CUSTOMSILS_FIELD].iloc[0]) if CUSTOMSILS_FIELD in group.columns else ""
 
@@ -480,7 +471,6 @@ def build_index(req: func.HttpRequest) -> func.HttpResponse:
             "DECLARATIONID": decl_id,
             "first_seen": first_seen,
             "last_seen": last_seen,
-            "team": team,
             "principal": principal,
             "company": company,
             "users": json.dumps(unique_users),       # stored as JSON string in parquet
@@ -534,43 +524,6 @@ def _discover_all_users(index_df: pd.DataFrame) -> list:
                 if u_upper and u_upper not in SYSTEM_USERS and u_upper not in ("NAN", "NONE", ""):
                     all_users.add(u_upper)
     return sorted(all_users)
-
-
-def _discover_user_teams(index_df: pd.DataFrame) -> dict:
-    """
-    From the index, determine which team(s) each user belongs to based on
-    the declaration types they work on.
-    Returns: { "USERNAME": ["import"], "OTHER": ["import", "export"] }
-    """
-    all_users = _discover_all_users(index_df)
-    user_teams = {}
-
-    for username in all_users:
-        username_upper = username.upper()
-        # Find declarations this user is involved in
-        user_rows = index_df[index_df["users"].apply(
-            lambda us: username_upper in [u.upper() for u in (us if isinstance(us, list) else [])]
-        )]
-        if user_rows.empty:
-            continue
-
-        types = user_rows["type"].value_counts()
-        has_import = any(t in IMPORT_TYPES for t in types.index)
-        has_export = any(t not in IMPORT_TYPES and t not in ("NAN", "NONE", "") for t in types.index)
-
-        teams = []
-        if has_import:
-            teams.append("import")
-        if has_export:
-            teams.append("export")
-        if not teams:
-            teams = ["import"]  # default
-        user_teams[username] = teams
-
-    # BATCHPROC appears in both teams
-    user_teams["BATCHPROC"] = ["import", "export"]
-
-    return user_teams
 
 
 def refresh_users(req: func.HttpRequest) -> func.HttpResponse:
@@ -991,56 +944,44 @@ def refresh_monthly(req: func.HttpRequest) -> func.HttpResponse:
     cutoff = (datetime.utcnow() - timedelta(days=30)).date().isoformat()
     recent = index_df[index_df["last_seen"] >= cutoff]
 
-    # Auto-discover users and their teams from index
-    index_df["human_users"] = index_df["human_users"].apply(_safe_json_loads) if "human_users" in index_df.columns else [[]]*len(index_df)
-
-    user_team_map = _discover_user_teams(index_df)
-    logging.info(f"refresh-monthly: discovered {len(user_team_map)} users")
+    all_users = _discover_all_users(index_df)
+    logging.info(f"refresh-monthly: discovered {len(all_users)} users")
 
     results = []
-    for username, teams in user_team_map.items():
-        for team_name in teams:
-            username_upper = username.upper()
+    for username in all_users:
+        username_upper = username.upper()
 
-            user_rows = recent[recent["users"].apply(
-                lambda us: username_upper in [u.upper() for u in (us if isinstance(us, list) else [])]
-            )]
+        user_rows = recent[recent["users"].apply(
+            lambda us: username_upper in [u.upper() for u in (us if isinstance(us, list) else [])]
+        )]
 
-            # BATCHPROC team filter
-            if username_upper in SYSTEM_USERS:
-                if team_name == "import":
-                    user_rows = user_rows[user_rows["type"].isin(IMPORT_TYPES)]
-                else:
-                    user_rows = user_rows[~user_rows["type"].isin(IMPORT_TYPES)]
+        if user_rows.empty:
+            continue
 
-            if user_rows.empty:
-                continue
+        total_manual = int((user_rows["has_manual_trigger"] & ~user_rows["has_interface"]).sum())
+        total_auto = int(user_rows["has_interface"].sum())
+        total_creations = total_manual + total_auto
+        total_sent = int(user_rows["sending_count"].sum())
 
-            total_manual = int((user_rows["has_manual_trigger"] & ~user_rows["has_interface"]).sum())
-            total_auto = int(user_rows["has_interface"].sum())
-            total_creations = total_manual + total_auto
-            total_sent = int(user_rows["sending_count"].sum())
+        # Working days with activity
+        dates = pd.to_datetime(user_rows["first_seen"], errors="coerce").dt.date
+        working_days_active = int(dates.apply(lambda d: d.weekday() < 5 if pd.notna(d) else False).sum())
 
-            # Working days with activity
-            dates = pd.to_datetime(user_rows["first_seen"], errors="coerce").dt.date
-            working_days_active = int(dates.apply(lambda d: d.weekday() < 5 if pd.notna(d) else False).sum())
+        avg_per_day = round(total_creations / working_days_active, 2) if working_days_active > 0 else 0
 
-            avg_per_day = round(total_creations / working_days_active, 2) if working_days_active > 0 else 0
-
-            results.append({
-                "user": username,
-                "team": team_name,
-                "total_files_handled": total_creations,
-                "manual_files": total_manual,
-                "automatic_files": total_auto,
-                "sent_files": total_sent,
-                "days_with_activity": working_days_active,
-                "avg_activity_per_day": avg_per_day,
-                "manual_vs_auto_ratio": {
-                    "manual_percent": round((total_manual / total_creations) * 100, 2) if total_creations else 0,
-                    "automatic_percent": round((total_auto / total_creations) * 100, 2) if total_creations else 0,
-                }
-            })
+        results.append({
+            "user": username,
+            "total_files_handled": total_creations,
+            "manual_files": total_manual,
+            "automatic_files": total_auto,
+            "sent_files": total_sent,
+            "days_with_activity": working_days_active,
+            "avg_activity_per_day": avg_per_day,
+            "manual_vs_auto_ratio": {
+                "manual_percent": round((total_manual / total_creations) * 100, 2) if total_creations else 0,
+                "automatic_percent": round((total_auto / total_creations) * 100, 2) if total_creations else 0,
+            }
+        })
 
     _write_json_blob(results, MONTHLY_SUMMARY_BLOB_PATH)
 
@@ -1088,41 +1029,16 @@ def refresh_10day(req: func.HttpRequest) -> func.HttpResponse:
     if "ACTIVECOMPANY" in df.columns:
         df = df[df["ACTIVECOMPANY"] != "DKM_VP"]
 
-    # Auto-discover all users and their teams from the raw data
-    all_user_codes = set(df["USERCODE"].dropna().unique()) - SYSTEM_USERS
-    user_team_map = {}
-    import_types_list = ["IDMS_IMPORT", "DMS_IMPORT"]
-    for user in all_user_codes:
-        user_decl_types = df[df["USERCODE"] == user]["TYPEDECLARATIONSSW"].value_counts()
-        has_import = any(t in import_types_list for t in user_decl_types.index)
-        has_export = any(t not in import_types_list and t not in ("NAN", "NONE", "") for t in user_decl_types.index)
-        teams = []
-        if has_import:
-            teams.append("import")
-        if has_export:
-            teams.append("export")
-        if not teams:
-            teams = ["import"]  # default
-        user_team_map[user] = teams
-
-    # Also include BATCHPROC in both teams
-    user_team_map["BATCHPROC"] = ["import", "export"]
+    # Auto-discover all unique users from the raw data
+    all_user_codes = set(df["USERCODE"].dropna().unique())
 
     results = []
-    for user, teams in user_team_map.items():
-      for team_name in teams:
+    for user in sorted(all_user_codes):
         user_daily = {day.strftime("%d/%m"): 0 for day in working_days}
-        recent_df = df.copy()
 
-        if user in SYSTEM_USERS:
-            if team_name == "import":
-                recent_df = recent_df[recent_df["TYPEDECLARATIONSSW"].isin(import_types_list)]
-            else:
-                recent_df = recent_df[~recent_df["TYPEDECLARATIONSSW"].isin(import_types_list)]
-
-        user_decls = recent_df[recent_df["USERCODE"] == user]["DECLARATIONID"].unique()
+        user_decls = df[df["USERCODE"] == user]["DECLARATIONID"].unique()
         if len(user_decls) == 0:
-            results.append({"user": user, "team": team_name, "daily_file_creations": user_daily})
+            results.append({"user": user, "daily_file_creations": user_daily})
             continue
 
         user_scope_df = df[df["DECLARATIONID"].isin(user_decls)].copy()
@@ -1151,7 +1067,7 @@ def refresh_10day(req: func.HttpRequest) -> func.HttpResponse:
                 key = first_action_date.strftime("%d/%m")
                 user_daily[key] += 1
 
-        results.append({"user": user, "team": team_name, "daily_file_creations": user_daily})
+        results.append({"user": user, "daily_file_creations": user_daily})
 
     _write_json_blob(results, SUMMARY_BLOB_PATH)
 
@@ -1261,8 +1177,6 @@ def _build_index_rows_for_df(df: pd.DataFrame) -> list:
         first_seen = group["HISTORYDATETIME"].min().date().isoformat()
         last_seen = group["HISTORYDATETIME"].max().date().isoformat()
 
-        type_val = str(group["TYPEDECLARATIONSSW"].iloc[0]).upper() if "TYPEDECLARATIONSSW" in group.columns else ""
-        team = "import" if type_val in ("DMS_IMPORT", "IDMS_IMPORT") else "export" if type_val in ("DMS_EXPORT", "IDMS_EXPORT") else "import"
         company = str(group["ACTIVECOMPANY"].iloc[0]) if "ACTIVECOMPANY" in group.columns else ""
         principal = str(group[CUSTOMSILS_FIELD].iloc[0]) if CUSTOMSILS_FIELD in group.columns else ""
 
@@ -1290,7 +1204,6 @@ def _build_index_rows_for_df(df: pd.DataFrame) -> list:
             "DECLARATIONID": decl_id,
             "first_seen": first_seen,
             "last_seen": last_seen,
-            "team": team,
             "principal": principal,
             "company": company,
             "users": json.dumps(unique_users),
@@ -1508,32 +1421,15 @@ def refresh_hot(req: func.HttpRequest) -> func.HttpResponse:
             df_10 = df_10[df_10["ACTIVECOMPANY"] != "DKM_VP"]
 
         results_10 = []
-        import_types_list = ["IDMS_IMPORT", "DMS_IMPORT"]
         # Auto-discover users from the 10-day data
-        all_10d_users = set(df_10["USERCODE"].dropna().unique()) - SYSTEM_USERS
-        hot_user_team_map = {}
-        for usr in all_10d_users:
-            usr_types = df_10[df_10["USERCODE"] == usr]["TYPEDECLARATIONSSW"].value_counts()
-            has_imp = any(t in import_types_list for t in usr_types.index)
-            has_exp = any(t not in import_types_list and t not in ("NAN", "NONE", "") for t in usr_types.index)
-            usr_teams = []
-            if has_imp: usr_teams.append("import")
-            if has_exp: usr_teams.append("export")
-            if not usr_teams: usr_teams = ["import"]
-            hot_user_team_map[usr] = usr_teams
-        hot_user_team_map["BATCHPROC"] = ["import", "export"]
+        all_10d_users = sorted(set(df_10["USERCODE"].dropna().unique()))
 
-        for user, teams in hot_user_team_map.items():
-          for team_name in teams:
+        for user in all_10d_users:
             user_daily = {day.strftime("%d/%m"): 0 for day in working_days}
-            scope = df_10.copy()
-            if user in SYSTEM_USERS:
-                scope = scope[scope["TYPEDECLARATIONSSW"].isin(import_types_list)] if team_name == "import" \
-                    else scope[~scope["TYPEDECLARATIONSSW"].isin(import_types_list)]
-
-            user_decls = scope[scope["USERCODE"] == user]["DECLARATIONID"].unique()
+            
+            user_decls = df_10[df_10["USERCODE"] == user]["DECLARATIONID"].unique()
             if len(user_decls) == 0:
-                results_10.append({"user": user, "team": team_name, "daily_file_creations": user_daily})
+                results_10.append({"user": user, "daily_file_creations": user_daily})
                 continue
 
             scope2 = df_10[df_10["DECLARATIONID"].isin(user_decls)].copy()
@@ -1557,7 +1453,7 @@ def refresh_hot(req: func.HttpRequest) -> func.HttpResponse:
                 if is_manual or is_automatic:
                     user_daily[first_action_date.strftime("%d/%m")] += 1
 
-            results_10.append({"user": user, "team": team_name, "daily_file_creations": user_daily})
+            results_10.append({"user": user, "daily_file_creations": user_daily})
 
         _write_json_blob(results_10, SUMMARY_BLOB_PATH)
         logging.info("refresh-hot: 10-day summary cache updated")
@@ -1685,50 +1581,35 @@ def list_users(req: func.HttpRequest) -> func.HttpResponse:
 
     index_df["users"] = index_df["users"].apply(_safe_json_loads)
 
-    # Discover users and their teams
-    user_team_map = _discover_user_teams(index_df)
-
-    user_details = []
-    for username, teams in sorted(user_team_map.items()):
-        username_upper = username.upper()
-
-        # Find this user's declarations
-        user_rows = index_df[index_df["users"].apply(
-            lambda us: username_upper in [u.upper() for u in (us if isinstance(us, list) else [])]
-        )]
-
-        if user_rows.empty:
+    # Optimized single-pass discovery of min/max dates for all users
+    user_map = {}
+    for _, row in index_df.iterrows():
+        # index_df["users"] is already parsed as list via _safe_json_loads above
+        user_list = row["users"]
+        if not isinstance(user_list, list):
             continue
+            
+        fs = row["first_seen"]
+        ls = row["last_seen"]
+        
+        for u in user_list:
+            u_upper = u.upper().strip()
+            if not u_upper or u_upper in SYSTEM_USERS or u_upper in ("NAN", "NONE", ""):
+                continue
+                
+            if u_upper not in user_map:
+                user_map[u_upper] = {
+                    "usercode": u_upper,
+                    "first_seen": fs,
+                    "last_seen": ls
+                }
+            else:
+                if fs and (not user_map[u_upper]["first_seen"] or fs < user_map[u_upper]["first_seen"]):
+                    user_map[u_upper]["first_seen"] = fs
+                if ls and (not user_map[u_upper]["last_seen"] or ls > user_map[u_upper]["last_seen"]):
+                    user_map[u_upper]["last_seen"] = ls
 
-        first_seen = user_rows["first_seen"].min() if "first_seen" in user_rows.columns else None
-        last_seen = user_rows["last_seen"].max() if "last_seen" in user_rows.columns else None
-        total_declarations = len(user_rows)
-
-        # Primary company
-        primary_company = None
-        if "company" in user_rows.columns:
-            comp_counts = user_rows["company"].value_counts()
-            comp_counts = comp_counts[~comp_counts.index.isin(["", "NAN", "NONE", "DKM_VP"])]
-            if not comp_counts.empty:
-                primary_company = comp_counts.idxmax()
-
-        # Primary declaration type
-        primary_type = None
-        if "type" in user_rows.columns:
-            type_counts = user_rows["type"].value_counts()
-            type_counts = type_counts[~type_counts.index.isin(["", "NAN", "NONE"])]
-            if not type_counts.empty:
-                primary_type = type_counts.idxmax()
-
-        user_details.append({
-            "usercode": username,
-            "teams": teams,
-            "total_declarations": total_declarations,
-            "first_seen": first_seen,
-            "last_seen": last_seen,
-            "primary_company": primary_company,
-            "primary_type": primary_type,
-        })
+    user_details = sorted(user_map.values(), key=lambda x: x["usercode"])
 
     return func.HttpResponse(
         json.dumps({
