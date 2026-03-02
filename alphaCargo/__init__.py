@@ -209,6 +209,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         # Fix HS codes and merge
         Inv_result = fix_hs_codes(Inv_result)
         merged_result = merge_invoice_and_pl(Inv_result, PLs_result)
+        merged_result["Items"] = sorted(merged_result.get("Items", []), key=lambda x: str(x.get("HS CODE") or ""))
+
         
         # Email Extraction
         cleaned_email_body_html = extract_and_clean(email)
