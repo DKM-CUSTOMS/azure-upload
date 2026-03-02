@@ -439,6 +439,7 @@ def build_index(req: func.HttpRequest) -> func.HttpResponse:
 
         company = str(group["ACTIVECOMPANY"].iloc[0]) if "ACTIVECOMPANY" in group.columns else ""
         principal = str(group[CUSTOMSILS_FIELD].iloc[0]) if CUSTOMSILS_FIELD in group.columns else ""
+        type_val = str(group["TYPEDECLARATIONSSW"].iloc[0]) if "TYPEDECLARATIONSSW" in group.columns else ""
 
         unique_users = list(group["USERCODE"].unique())
         human_users = [u for u in unique_users if u not in system_users]
@@ -1179,6 +1180,7 @@ def _build_index_rows_for_df(df: pd.DataFrame) -> list:
 
         company = str(group["ACTIVECOMPANY"].iloc[0]) if "ACTIVECOMPANY" in group.columns else ""
         principal = str(group[CUSTOMSILS_FIELD].iloc[0]) if CUSTOMSILS_FIELD in group.columns else ""
+        type_val = str(group["TYPEDECLARATIONSSW"].iloc[0]) if "TYPEDECLARATIONSSW" in group.columns else ""
 
         unique_users = list(group["USERCODE"].unique())
         human_users = [u for u in unique_users if u not in system_users]
