@@ -48,6 +48,11 @@ def classify_file_activity(global_history: List[str], user_history: List[str] = 
     
     # Ensure inputs are sets for faster lookup
     global_set = set(global_history)
+    
+    # Check for starting point: if missing, completely ignore for creation calculations
+    if not {"INTERFACE", "NEW", "COPIED", "COPY"}.intersection(global_set):
+        return False, False
+        
     user_set = set(user_history) if user_history is not None else global_set
     
     is_automatic = 'INTERFACE' in global_set
@@ -91,6 +96,11 @@ def classify_file_activity(global_history: List[str], user_history: List[str] = 
                     if target_user.upper() == 'BATCHPROC':
                         return False, True
                     return False, False
+            else:
+                # A human created the file. Only the creator gets creation credit.
+                if target_user.upper() != first_user:
+                    return False, False
+                    
     
     # Check intersection with manual statuses in the specific scope (User or Global)
     has_manual_trigger = bool(MANUAL_STATUSES.intersection(user_set))
