@@ -447,11 +447,13 @@ def build_index(req: func.HttpRequest) -> func.HttpResponse:
         # created_by = first user action
         created_by = str(group.iloc[0]["USERCODE"])
 
-        # modified_by = human with most MODIFIED actions (or created_by fallback)
-        mod_rows = group[group["HISTORY_STATUS"] == "MODIFIED"]
+        # modified_by = human with most MODIFIED actions (fallback to first human, then created_by)
+        human_actions = group[~group["USERCODE"].isin(system_users)]
+        mod_rows = human_actions[human_actions["HISTORY_STATUS"] == "MODIFIED"]
         if not mod_rows.empty:
-            human_mods = mod_rows[~mod_rows["USERCODE"].isin(system_users)]
-            modified_by = human_mods["USERCODE"].value_counts().idxmax() if not human_mods.empty else created_by
+            modified_by = str(mod_rows["USERCODE"].value_counts().idxmax())
+        elif not human_actions.empty:
+            modified_by = str(human_actions.iloc[0]["USERCODE"])
         else:
             modified_by = created_by
 
@@ -891,24 +893,39 @@ def _calculate_user_metrics_from_index(index_df: pd.DataFrame, username: str) ->
     if user_rows.empty:
         return {"user": username, "summary": {}, "monthly_breakdown": []}
 
-    total_manual = int((user_rows["has_manual_trigger"] & ~user_rows["has_interface"]).sum())
-    total_auto = int(user_rows["has_interface"].sum())
-    total_files = len(user_rows)
-    durations = user_rows["file_creation_duration"].dropna().tolist()
+    system_users = {"BATCHPROC", "ADMIN", "SYSTEM", "BATCH_PROC"}
+    is_creator = user_rows["created_by"] == username_upper
+    is_modifier = user_rows["modified_by"] == username_upper
+    sys_created = user_rows["created_by"].isin(system_users)
+    
+    gets_credit = (is_creator & ~sys_created) | (sys_created & is_modifier)
+    credited_rows = user_rows[gets_credit].copy()
+
+    is_auto_file = credited_rows["has_interface"] | credited_rows["created_by"].isin(system_users)
+    is_manual_file = credited_rows["has_manual_trigger"] & ~is_auto_file
+
+    total_manual = int(is_manual_file.sum())
+    total_auto = int(is_auto_file.sum())
+    total_files = total_manual + total_auto
+    durations = credited_rows["file_creation_duration"].dropna().tolist()
     avg_duration = round(sum(durations) / len(durations), 2) if durations else None
+    
     total_mods = int(user_rows["modification_count"].sum())
 
-    user_rows_copy = user_rows.copy()
-    user_rows_copy["month"] = pd.to_datetime(
-        user_rows_copy["first_seen"], errors="coerce"
+    credited_rows["month"] = pd.to_datetime(
+        credited_rows["first_seen"], errors="coerce"
     ).dt.to_period("M").astype(str)
     monthly = []
-    for month_str, grp in user_rows_copy.groupby("month"):
+    for month_str, grp in credited_rows.groupby("month"):
+        grp_auto = grp["has_interface"] | grp["created_by"].isin(system_users)
+        grp_manual = grp["has_manual_trigger"] & ~grp_auto
+        manual_files = int(grp_manual.sum())
+        automatic_files = int(grp_auto.sum())
         monthly.append({
             "month": month_str,
-            "total_files": len(grp),
-            "manual_files": int((grp["has_manual_trigger"] & ~grp["has_interface"]).sum()),
-            "automatic_files": int(grp["has_interface"].sum()),
+            "total_files": manual_files + automatic_files,
+            "manual_files": manual_files,
+            "automatic_files": automatic_files,
             "total_modifications": int(grp["modification_count"].sum()),
         })
 
@@ -943,7 +960,7 @@ def refresh_monthly(req: func.HttpRequest) -> func.HttpResponse:
     index_df["users"] = index_df["users"].apply(_safe_json_loads)
 
     cutoff = (datetime.utcnow() - timedelta(days=30)).date().isoformat()
-    recent = index_df[index_df["last_seen"] >= cutoff]
+    recent = index_df[index_df["first_seen"] >= cutoff]
 
     all_users = _discover_all_users(index_df)
     logging.info(f"refresh-monthly: discovered {len(all_users)} users")
@@ -959,14 +976,25 @@ def refresh_monthly(req: func.HttpRequest) -> func.HttpResponse:
         if user_rows.empty:
             continue
 
-        total_manual = int((user_rows["has_manual_trigger"] & ~user_rows["has_interface"]).sum())
-        total_auto = int(user_rows["has_interface"].sum())
-        total_creations = total_manual + total_auto
-        total_sent = int(user_rows["sending_count"].sum())
+        system_users = {"BATCHPROC", "ADMIN", "SYSTEM", "BATCH_PROC"}
+        is_creator = user_rows["created_by"] == username_upper
+        is_modifier = user_rows["modified_by"] == username_upper
+        sys_created = user_rows["created_by"].isin(system_users)
+        
+        gets_credit = (is_creator & ~sys_created) | (sys_created & is_modifier)
+        credited_rows = user_rows[gets_credit]
 
-        # Working days with activity
-        dates = pd.to_datetime(user_rows["first_seen"], errors="coerce").dt.date
-        working_days_active = int(dates.apply(lambda d: d.weekday() < 5 if pd.notna(d) else False).sum())
+        is_auto_file = credited_rows["has_interface"] | credited_rows["created_by"].isin(system_users)
+        is_manual_file = credited_rows["has_manual_trigger"] & ~is_auto_file
+
+        total_manual = int(is_manual_file.sum())
+        total_auto = int(is_auto_file.sum())
+        total_creations = total_manual + total_auto
+        total_sent = int(credited_rows["sending_count"].sum())
+
+        # Working days with activity (unique weekdays)
+        dates = pd.to_datetime(credited_rows["first_seen"], errors="coerce").dt.date
+        working_days_active = len(set(d for d in dates if pd.notna(d) and d.weekday() < 5))
 
         avg_per_day = round(total_creations / working_days_active, 2) if working_days_active > 0 else 0
 
@@ -1186,10 +1214,12 @@ def _build_index_rows_for_df(df: pd.DataFrame) -> list:
         human_users = [u for u in unique_users if u not in system_users]
         created_by = str(group.iloc[0]["USERCODE"])
 
-        mod_rows = group[group["HISTORY_STATUS"] == "MODIFIED"]
+        human_actions = group[~group["USERCODE"].isin(system_users)]
+        mod_rows = human_actions[human_actions["HISTORY_STATUS"] == "MODIFIED"]
         if not mod_rows.empty:
-            human_mods = mod_rows[~mod_rows["USERCODE"].isin(system_users)]
-            modified_by = human_mods["USERCODE"].value_counts().idxmax() if not human_mods.empty else created_by
+            modified_by = str(mod_rows["USERCODE"].value_counts().idxmax())
+        elif not human_actions.empty:
+            modified_by = str(human_actions.iloc[0]["USERCODE"])
         else:
             modified_by = created_by
 
