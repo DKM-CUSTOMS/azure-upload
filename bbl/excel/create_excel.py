@@ -25,17 +25,27 @@ def write_to_excel(json_string):
         "Country",
         "Inco Term",
         "Place",
-        "ILS number"
+        "ILS number",
+        "Vissel"
     ]
     
+    freight_data = data.get('Freight', {})
+    vat_data = data.get('Vat', {})
+    
+    freight_amount = freight_data.get('freight', '') if isinstance(freight_data, dict) else freight_data
+    vat_amount = vat_data.get('vat', '') if isinstance(vat_data, dict) else vat_data
+    
+    freight_ccy = freight_data.get('currency', '') if isinstance(freight_data, dict) else ''
+    vat_ccy = vat_data.get('currency', '') if isinstance(vat_data, dict) else ''
+
     values1 = [
         data.get('Vat Number', ''),
         data.get('Principal', '').upper(),
         data.get('Contact', '').upper(),
         data.get('container', ''),
         data.get('Other Ref', ''),
-        data.get('Freight', ''),
-        data.get('Vat', ''),
+        freight_amount,
+        vat_amount,
         "",
         '',
         '',
@@ -43,10 +53,31 @@ def write_to_excel(json_string):
         '',
         '',
         '',
-        data.get('Incoterm', '')[0] if data.get('Incoterm') is not None else '',
-        data.get('Incoterm', '')[1] if data.get('Incoterm') is not None and len(data.get('Incoterm')) > 1 else '',
+        data.get('Incoterm', '')[0] if data.get('Incoterm') is not None and isinstance(data.get('Incoterm'), list) and len(data.get('Incoterm')) > 0 else (data.get('Incoterm', '')[0] if isinstance(data.get('Incoterm'), str) and len(data.get('Incoterm')) > 0 else ''),
+        data.get('Incoterm', '')[1] if data.get('Incoterm') is not None and isinstance(data.get('Incoterm'), list) and len(data.get('Incoterm')) > 1 else '',
         data.get("Customs code", ''),
         data.get("ILS_NUMBER", ''),
+    ]
+
+    values2 = [
+        "",
+        "",
+        "",
+        "",
+        "",
+        freight_ccy,
+        vat_ccy,
+        "",
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
     ]
 
     header2 = [
@@ -107,6 +138,9 @@ def write_to_excel(json_string):
 
     # Add values to the second row
     ws.append(values1)
+    
+    # Add currencies to the cell below the values
+    ws.append(values2)
 
     # Add empty rows and totals
     ws.append(row_empty)

@@ -3,6 +3,12 @@ import re
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import os
+import tempfile
+import urllib3
+import pandas as pd
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from bbl.helpers.searchOnPorts import search_ports
 
@@ -54,8 +60,8 @@ def process_container_data(data):
         "container": valid_container,
         "dispatch_country": dispatch_country,
         "Incoterm": incoterm_array,
-        "Freight": round(final_freight, 2),
-        "Vat": round(final_vat, 2),
+        "Freight": final_freight,
+        "Vat": final_vat,
         "items": items,
         "totals": {
             "Gross Weight": total_gross_weight,
@@ -96,50 +102,85 @@ def extract_freight(value):
     return numbers[:2] if numbers else [0.0]
 
 def fetch_exchange_rate(currency_code):
-    # Get the current year and month in "YYYYMM" format
     current_date = datetime.now().strftime("%Y%m")
-
-    # Insert the dynamic part into the URL
-    url = f"https://www.belastingdienst.nl/data/douane_wisselkoersen/wks.douane.wisselkoersen.dd{current_date}.xml"
+    url = "https://eservices.minfin.fgov.be/extTariffBrowser/FileResourceForHomePageServlet?fname=listed_currencies.xlsx&lang=EN"
     
-    # Fetch XML content from the URL
-    response = requests.get(url)
-    logging.error(url)
+    # Cache the file per month locally to avoid fetching it every time
+    temp_dir = tempfile.gettempdir()
+    cache_file = os.path.join(temp_dir, f"listed_currencies_{current_date}.xlsx")
     
-    if response.status_code == 200:
-        # Parse XML content
-        root = ET.fromstring(response.content)
-        
-        # Find the currency block that matches the currency code
-        for rate in root.findall("douaneMaandwisselkoers"):
-            code = rate.find("muntCode").text
+    if not os.path.exists(cache_file):
+        try:
+            # Fetch the Excel file, ignoring SSL verification as the site's cert might have issues
+            response = requests.get(url, verify=False, timeout=15)
+            response.raise_for_status()
+            with open(cache_file, "wb") as f:
+                f.write(response.content)
+        except Exception as e:
+            logging.error(f"Failed to fetch exchange rate Excel: {e}")
+            return None
             
-            if code == currency_code:
-                foreign_rate = rate.find("tariefInVreemdeValuta").text
-                return foreign_rate
-    
+    try:
+        df = pd.read_excel(cache_file)
+        
+        # Month mapping internally to columns based on current month
+        month_abbr = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+        current_month_idx = datetime.now().month - 1
+        current_month_col = month_abbr[current_month_idx]
+        
+        # Searching the row dynamically for the currency column
+        currency_col = None
+        for col in df.columns:
+            if "Box 22" in str(col):
+                currency_col = col
+                break
+                
+        # Fallback to indexing if exact name changes
+        if not currency_col:
+            currency_col = df.columns[2]
+            
+        # Match the requested currency code
+        match = df[df[currency_col].astype(str).str.strip() == currency_code]
+        
+        if not match.empty:
+            rate = match.iloc[0].get(current_month_col)
+            if pd.isna(rate):
+                return None
+            return str(rate)
+            
+    except Exception as e:
+        logging.error(f"Error parsing exchange rate Excel: {e}")
+        return None
+        
     return None  # Return None if the currency was not found or request failed
 
 def calculationVATndFREIGHT(price, freightUSD, vat1, vat2):
     # Example usage
     currency = 'USD'  # Replace with the desired currency code
-    EXCHANGE_RATE = 1.1739#safe_float_conversion(fetch_exchange_rate(currency))
+    EXCHANGE_RATE = safe_float_conversion(fetch_exchange_rate(currency))
 
     # First value in freightUSD array is in USD, convert to EUR
     freight_in_usd = freightUSD[0] if len(freightUSD) > 0 else 0
     freight_in_eur = freightUSD[1] if len(freightUSD) > 1 else 0
 
-    # Calculate insurance and freight in EUR
-    insurance = price * 0.3 / 100
-    freightEUR = (freight_in_usd / EXCHANGE_RATE) + insurance
+    # Handle freight currency logic
+    if not freight_in_eur or freight_in_eur == 0:
+        final_freight = {"freight": round(freight_in_usd, 2), "currency": "USD"}
+    else:
+        # Calculate freight in EUR
+        freightEUR = (freight_in_usd / EXCHANGE_RATE) if EXCHANGE_RATE else 0
+        total_freightEUR = freightEUR + freight_in_eur
+        final_freight = {"freight": round(total_freightEUR, 2), "currency": "EUR"}
 
-    # Add the EUR freight value (second value) to the final EUR freight
-    total_freightEUR = freightEUR + freight_in_eur
+    # Handle VAT currency logic
+    if not vat2 or vat2 == 0:
+        final_vat = {"vat": round(vat1, 2), "currency": "USD"}
+    else:
+        # Calculate VAT in EUR
+        vatEUR = (vat1 / EXCHANGE_RATE) + vat2 if EXCHANGE_RATE else 0
+        final_vat = {"vat": round(vatEUR, 2), "currency": "EUR"}
 
-    # Calculate VAT in EUR
-    vatEUR = vat1 / EXCHANGE_RATE + vat2
-
-    return [total_freightEUR, vatEUR]
+    return [final_freight, final_vat]
 
 # Helper function to safely convert values to float
 def safe_float_conversion(value):
