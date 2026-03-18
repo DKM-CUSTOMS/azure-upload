@@ -50,8 +50,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json"
         )
 
-    result_data = None
+    result_data = None       # Will hold header/string fields from the FIRST Excel
     second_layout = False
+    all_items = []           # Accumulated items from ALL Excel files
+    total_value_sum = 0.0
+    net_weight_sum = 0.0
+    gross_weight_sum = 0.0
+    collis_sum = 0.0
 
     for file_data in files_data:
         filename = file_data.get("filename")
@@ -96,12 +101,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                 return get_cell_value(col_value, r)
                         return None
 
+                    # Detect second layout (EUR1 present)
                     for row in sheet.iter_rows(values_only=True):
                         for cell in row:
                             if cell and str(cell).strip().upper() == "EUR1":
                                 second_layout = True
                                 break
 
+                    # Read references and invoice numbers
                     references = []
                     invoices = []
                     ref_start_row = None
@@ -126,7 +133,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         "office_of_exit": find_value_by_label("Office of Exit", 'J', 'K'),
                         "country_of_destination": find_value_by_label("Country", 'J', 'K'),
                         "total_amount": find_value_by_label("Total Amount", 'J', 'K'),
-                        "currency": find_value_by_label("Currency", 'J', 'K'),
+                        "currency": get_cell_value('K', 10),   # Fixed cell K10
                         "pallet_info": extract_number(find_value_by_label("Pallet", 'J', 'K')),
                         "total_gross_weight_kg": find_value_by_label("Total Gross Weight", 'J', 'K'),
                         "total_net_weight_kg": find_value_by_label("Total Net Weight", 'J', 'K'),
@@ -141,6 +148,25 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         "country": find_value_by_label("Country", 'M', 'N'),
                     }
 
+                    # --- Accumulate numeric totals ---
+                    try:
+                        total_value_sum += float(header_data.get("total_amount") or 0)
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        net_weight_sum += float(header_data.get("total_net_weight_kg") or 0)
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        gross_weight_sum += float(header_data.get("total_gross_weight_kg") or 0)
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        collis_sum += float(header_data.get("pallet_info") or 0)
+                    except (ValueError, TypeError):
+                        pass
+
+                    # --- Parse line items ---
                     line_items = []
                     for row_num in range(2, 1000):
                         hs_code = sheet[f"B{row_num}"].value
@@ -163,55 +189,63 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         if eur1_cell.value and "EUR1" in str(eur1_cell.value).upper():
                             eur1_flag = "EUR1"
 
-                        line_items.append({
-                            "HSCode": str(hs_code),
-                            "Origin": str(origin),
-                            "Amount": float(amount) if amount else 0.0,
-                            "gross_weight_kg": float(gross) if gross else 0.0,
-                            "NetWeight": float(net) if net else 0.0,
-                            "Description": str(material),
-                            "EUR1_Flag": eur1_flag
-                        })
+                        try:
+                            line_items.append({
+                                "HSCode": str(hs_code),
+                                "Origin": str(origin),
+                                "Amount": float(amount) if amount else 0.0,
+                                "gross_weight_kg": float(gross) if gross else 0.0,
+                                "NetWeight": float(net) if net else 0.0,
+                                "Description": str(material),
+                                "EUR1_Flag": eur1_flag
+                            })
+                        except (ValueError, TypeError):
+                            logging.warning(f"Skipping row {row_num} due to invalid numeric data: amount={amount}, gross={gross}, net={net}")
+                            continue
 
-                    full_address = ", ".join(filter(None, [
-                        str(client_data["name"]),
-                        str(client_data["address"]),
-                        str(client_data["postal_code_city"]),
-                        str(client_data["country"])
-                    ]))
+                    all_items.extend(line_items)
 
-                    parser = AddressParser()
-                    parsed_address_list = parser.parse_address(full_address)
-                    parsed_address = {
-                        "company_name": parsed_address_list[0] if len(parsed_address_list) > 0 else None,
-                        "street": parsed_address_list[1] if len(parsed_address_list) > 1 else None,
-                        "city": parsed_address_list[2] if len(parsed_address_list) > 2 else None,
-                        "postal_code": parsed_address_list[3] if len(parsed_address_list) > 3 else None,
-                        "country_code": parsed_address_list[4] if len(parsed_address_list) > 4 else None,
-                    }
+                    # --- First Excel provides the header/string skeleton ---
+                    if result_data is None:
+                        full_address = ", ".join(filter(None, [
+                            str(client_data["name"]),
+                            str(client_data["address"]),
+                            str(client_data["postal_code_city"]),
+                            str(client_data["country"])
+                        ]))
 
-                    result_data = {
-                        "ShipmentReference": header_data.get("reference"),
-                        "Incoterm": (str(header_data.get("delivery_conditions") or "")) + " " + (str(parsed_address.get("city") or "")),
-                        "Total Value": header_data.get("total_amount"),
-                        "NetWeight": header_data.get("total_net_weight_kg"),
-                        "GrossWeight": header_data.get("total_gross_weight_kg"),
-                        "currency": header_data.get("currency"),
-                        "Collis": header_data.get("pallet_info"),
-                        "OfficeOfExit": header_data.get("office_of_exit"),
-                        "PlaceOfDelivery": parsed_address,
-                        "Invoice No": header_data.get("invoice_number"),
-                        "Items": line_items,
-                        "EORI": header_data.get("eori"),
-                        "Route": header_data.get("route")
-                    }
+                        parser = AddressParser()
+                        parsed_address_list = parser.parse_address(full_address)
+                        parsed_address = {
+                            "company_name": parsed_address_list[0] if len(parsed_address_list) > 0 else None,
+                            "street": parsed_address_list[1] if len(parsed_address_list) > 1 else None,
+                            "city": parsed_address_list[2] if len(parsed_address_list) > 2 else None,
+                            "postal_code": parsed_address_list[3] if len(parsed_address_list) > 3 else None,
+                            "country_code": parsed_address_list[4] if len(parsed_address_list) > 4 else None,
+                        }
 
-                    try:
-                        response = call_logic_app("STANLEY", company="vp")
-                        if response.get("success"):
-                            result_data["ILS_NUMBER"] = response["doss_nr"]
-                    except Exception as e:
-                        logging.error(f"ILS_NUMBER fetch failed: {e}")
+                        result_data = {
+                            "ShipmentReference": header_data.get("reference"),
+                            "Incoterm": (str(header_data.get("delivery_conditions") or "")) + " " + (str(parsed_address.get("city") or "")),
+                            "Total Value": 0.0,       # Will be set after loop from sum
+                            "NetWeight": 0.0,
+                            "GrossWeight": 0.0,
+                            "currency": header_data.get("currency"),
+                            "Collis": 0.0,
+                            "OfficeOfExit": header_data.get("office_of_exit"),
+                            "PlaceOfDelivery": parsed_address,
+                            "Invoice No": header_data.get("invoice_number"),
+                            "Items": [],
+                            "EORI": header_data.get("eori"),
+                            "Route": header_data.get("route")
+                        }
+
+                        try:
+                            response = call_logic_app("STANLEY", company="vp")
+                            if response.get("success"):
+                                result_data["ILS_NUMBER"] = response["doss_nr"]
+                        except Exception as e:
+                            logging.error(f"ILS_NUMBER fetch failed: {e}")
 
                 finally:
                     if workbook is not None:
@@ -229,6 +263,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 _safe_remove(temp_file_path)
             except Exception as e:
                 logging.error(f"Failed to remove temp file {temp_file_path}: {e}")
+
+    # --- Merge accumulated data into result_data ---
+    if result_data is not None:
+        result_data["Items"] = all_items
+        result_data["Total Value"] = total_value_sum
+        result_data["NetWeight"] = net_weight_sum
+        result_data["GrossWeight"] = gross_weight_sum
+        result_data["Collis"] = collis_sum
 
     if not result_data:
         return func.HttpResponse(
