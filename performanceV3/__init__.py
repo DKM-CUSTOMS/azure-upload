@@ -13,7 +13,8 @@ New data architecture that eliminates memory crashes on Azure consumption plan.
 ║      5. Rebuild user caches — only for users that appear in the new data    ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  DAILY (2 AM cold rebuild)                                                  ║
-║    POST /transform-daily → /build-index → /refresh-monthly → /refresh      ║
+║    POST /
+transform-daily → /build-index → /refresh-monthly → /refresh      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  INSTANT GET endpoints (always read from cache — no calculation)            ║
 ║    GET /           → 10-day summary cache                                   ║
@@ -213,7 +214,7 @@ def transform_daily(req: func.HttpRequest) -> func.HttpResponse:
     df = pd.concat(frames, ignore_index=True)
 
     # Standardise columns
-    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW"]:
+    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.upper()
 
@@ -279,7 +280,7 @@ def _transform_one_day(target_date, force: bool) -> dict:
         return {"date": date_str, "status": "no_data", "reason": "all JSON files were empty or unreadable"}
 
     df = pd.concat(frames, ignore_index=True)
-    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW"]:
+    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.upper()
     df["HISTORYDATETIME"] = pd.to_datetime(df["HISTORYDATETIME"], errors="coerce", format="mixed")
@@ -373,7 +374,7 @@ def transform_daily_range(req: func.HttpRequest) -> func.HttpResponse:
 # Reads ALL daily parquet files and builds/updates the file_index.parquet.
 # The index has ONE row per DECLARATIONID with pre-computed flags.
 # ===========================================================================
-CUSTOMSILS_FIELD = "CUSTOMSILS"    # principal field (may be absent from source)
+PRINCIPAL_FIELD = "PRINCIPAL"    # principal field from euchistory data
 
 def build_index(req: func.HttpRequest) -> func.HttpResponse:
     """
@@ -409,7 +410,7 @@ def build_index(req: func.HttpRequest) -> func.HttpResponse:
     df = pd.concat(frames, ignore_index=True)
 
     # Standardise
-    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW"]:
+    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.upper()
 
@@ -438,7 +439,7 @@ def build_index(req: func.HttpRequest) -> func.HttpResponse:
         last_seen = group["HISTORYDATETIME"].max().date().isoformat()
 
         company = str(group["ACTIVECOMPANY"].iloc[0]) if "ACTIVECOMPANY" in group.columns else ""
-        principal = str(group[CUSTOMSILS_FIELD].iloc[0]) if CUSTOMSILS_FIELD in group.columns else ""
+        principal = str(group[PRINCIPAL_FIELD].iloc[0]) if PRINCIPAL_FIELD in group.columns else ""
         type_val = str(group["TYPEDECLARATIONSSW"].iloc[0]) if "TYPEDECLARATIONSSW" in group.columns else ""
 
         unique_users = list(group["USERCODE"].unique())
@@ -646,7 +647,7 @@ def _compute_rich_user_metrics(df: pd.DataFrame, username: str) -> dict:
     # Normalise the DataFrame
     # -----------------------------------------------------------------------
     df = df.copy()
-    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", "CUSTOMSILS"]:
+    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.upper()
 
@@ -684,10 +685,9 @@ def _compute_rich_user_metrics(df: pd.DataFrame, username: str) -> dict:
         }
 
     # principal_specialization (which client/principal the user handles most)
-    # CUSTOMSILS = the principal/client identifier on the declaration
     principal_spec = {}
-    if "CUSTOMSILS" in df.columns and not user_actions.empty:
-        principal_counts = user_actions["CUSTOMSILS"].value_counts().to_dict()
+    if PRINCIPAL_FIELD in df.columns and not user_actions.empty:
+        principal_counts = user_actions[PRINCIPAL_FIELD].value_counts().to_dict()
         principal_spec = {
             k: int(v) for k, v in principal_counts.items()
             if k not in ("NAN", "NONE", "", "0", "0.0")
@@ -714,11 +714,19 @@ def _compute_rich_user_metrics(df: pd.DataFrame, username: str) -> dict:
         "manual_file_ids": [],
         "automatic_file_ids": [],
         "creation_durations": [],
+        "deleted_file_ids": [],
+        "deleted_own_file_ids": [],
+        "deleted_others_file_ids": [],
     })
 
     total_manual = 0
     total_automatic = 0
     total_modifications = 0
+    total_deletions = 0
+    total_deleted_own = 0
+    total_deleted_others = 0
+    total_deleted_manual = 0
+    total_deleted_automatic = 0
     all_durations = []
 
     for decl_id, group in df.groupby("DECLARATIONID"):
@@ -762,6 +770,29 @@ def _compute_rich_user_metrics(df: pd.DataFrame, username: str) -> dict:
                     daily_data[day_str]["modification_file_ids"].append(decl_id)
             total_modifications += len(user_mods)
 
+        # Deletion tracking: did this user delete this declaration?
+        # Runs AFTER classification so we know if it was their own file or not
+        if "DELETED" in user_statuses:
+            deletion_rows = user_decl_rows[user_decl_rows["HISTORY_STATUS"] == "DELETED"]
+            deletion_date = deletion_rows["HISTORYDATETIME"].min().date().isoformat()
+
+            total_deletions += 1
+            daily_data[deletion_date]["deleted_file_ids"].append(decl_id)
+
+            if is_manual or is_automatic:
+                # User deleted their own file (they get credit for creating it)
+                total_deleted_own += 1
+                daily_data[deletion_date]["deleted_own_file_ids"].append(decl_id)
+            else:
+                # User deleted someone else's file
+                total_deleted_others += 1
+                daily_data[deletion_date]["deleted_others_file_ids"].append(decl_id)
+
+            if is_manual:
+                total_deleted_manual += 1
+            elif is_automatic:
+                total_deleted_automatic += 1
+
         # File creation duration: user's first MODIFIED → global WRT_ENT
         session_start = None
         duration = None
@@ -800,6 +831,9 @@ def _compute_rich_user_metrics(df: pd.DataFrame, username: str) -> dict:
             "avg_creation_time": avg_time,
             "manual_file_ids": data["manual_file_ids"],
             "automatic_file_ids": data["automatic_file_ids"],
+            "deleted_file_ids": data["deleted_file_ids"],
+            "deleted_own_file_ids": data["deleted_own_file_ids"],
+            "deleted_others_file_ids": data["deleted_others_file_ids"],
         })
 
     # -----------------------------------------------------------------------
@@ -875,6 +909,11 @@ def _compute_rich_user_metrics(df: pd.DataFrame, username: str) -> dict:
             "activity_days": activity_days,
             "inactivity_days": inactivity_days,
             "hour_with_most_activity": hour_with_most_activity,
+            "total_deletions": total_deletions,
+            "deleted_own_files": total_deleted_own,
+            "deleted_others_files": total_deleted_others,
+            "deleted_manual_files": total_deleted_manual,
+            "deleted_automatic_files": total_deleted_automatic,
         },
     }
 
@@ -1047,7 +1086,7 @@ def refresh_10day(req: func.HttpRequest) -> func.HttpResponse:
     df = pd.concat(frames, ignore_index=True)
 
     # Standardise
-    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW"]:
+    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.upper()
 
@@ -1207,7 +1246,7 @@ def _build_index_rows_for_df(df: pd.DataFrame) -> list:
         last_seen = group["HISTORYDATETIME"].max().date().isoformat()
 
         company = str(group["ACTIVECOMPANY"].iloc[0]) if "ACTIVECOMPANY" in group.columns else ""
-        principal = str(group[CUSTOMSILS_FIELD].iloc[0]) if CUSTOMSILS_FIELD in group.columns else ""
+        principal = str(group[PRINCIPAL_FIELD].iloc[0]) if PRINCIPAL_FIELD in group.columns else ""
         type_val = str(group["TYPEDECLARATIONSSW"].iloc[0]) if "TYPEDECLARATIONSSW" in group.columns else ""
 
         unique_users = list(group["USERCODE"].unique())
@@ -1332,7 +1371,7 @@ def refresh_hot(req: func.HttpRequest) -> func.HttpResponse:
     new_df = pd.concat(frames, ignore_index=True)
 
     # Standardise
-    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW"]:
+    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
         if col in new_df.columns:
             new_df[col] = new_df[col].astype(str).str.strip().str.upper()
     new_df["HISTORYDATETIME"] = pd.to_datetime(new_df["HISTORYDATETIME"], errors="coerce", format="mixed")
@@ -1443,7 +1482,7 @@ def refresh_hot(req: func.HttpRequest) -> func.HttpResponse:
 
     if day_frames:
         df_10 = pd.concat(day_frames, ignore_index=True)
-        for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW"]:
+        for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
             if col in df_10.columns:
                 df_10[col] = df_10[col].astype(str).str.strip().str.upper()
         df_10["HISTORYDATETIME"] = pd.to_datetime(df_10["HISTORYDATETIME"], errors="coerce", format="mixed")
