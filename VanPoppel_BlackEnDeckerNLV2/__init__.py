@@ -334,7 +334,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         contact = call.send_request(role="user", prompt_text=prompt)
 
         result_data["Contact"] = contact.strip()[:10]
-        logging.error(json.dumps(result_data, indent=4))
+
         excel_file_bytes = write_to_excel(result_data, second_layout)
         reference = result_data.get("ShipmentReference", f"ref-{uuid.uuid4().hex}")
 
