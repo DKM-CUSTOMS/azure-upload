@@ -99,16 +99,16 @@ def _to_float(value: Any) -> float | None:
 
 
 def _norm_date(raw: str) -> str:
-    """Normalise various date formats to dd/mm/yyyy."""
+    """Normalise various date formats to yyyy-mm-dd."""
     raw = raw.strip()
-    # dd/mm/yyyy or dd-mm-yyyy
+    # dd/mm/yyyy or dd-mm-yyyy or dd.mm.yyyy
     m = re.match(r"(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})", raw)
     if m:
-        return f"{int(m.group(1)):02d}/{int(m.group(2)):02d}/{m.group(3)}"
-    # yyyy-mm-dd
-    m = re.match(r"(\d{4})[/\-\.](\d{2})[/\-\.](\d{2})", raw)
+        return f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+    # yyyy-mm-dd or yyyy/mm/dd
+    m = re.match(r"(\d{4})[/\-\.](\d{1,2})[/\-\.](\d{1,2})", raw)
     if m:
-        return f"{m.group(3)}/{m.group(2)}/{m.group(1)}"
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
     return raw
 
 
