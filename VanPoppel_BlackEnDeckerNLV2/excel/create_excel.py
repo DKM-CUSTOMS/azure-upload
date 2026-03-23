@@ -34,14 +34,13 @@ def write_to_excel(json_string, second_layout=False):
         try:
             logger.info("Processing address information")
             address = data.get('PlaceOfDelivery', {})
-            logger.debug(f"Address data: {address}")
             
             name = address.get('company_name', '')
             street = address.get('street', '')
             city = address.get('city', '')
             code_postal = address.get('postal_code', '')
             country = address.get('country_code', '')
-            logger.debug("Address components extracted")
+
         except Exception as e:
             logger.error(f"Error processing address: {str(e)}")
             name = street = city = code_postal = country = ''
@@ -133,12 +132,14 @@ def write_to_excel(json_string, second_layout=False):
                                     mini_row.append(obj.get("NetWeight", ''))
                                 elif ordered_key == "Invoice value":
                                     mini_row.append(obj.get("Amount", "")) 
+                                elif ordered_key == "Currency":
+                                    mini_row.append(data.get("currency", "")) 
                                 elif ordered_key == "Invoice number":
                                     mini_row.append(obj.get("InvoiceNumber", ''))
                                 elif ordered_key == "Invoice date":
                                     mini_row.append(obj.get("InvoiceDate", ''))
                                 elif ordered_key == "Rex/other":
-                                    mini_row.append(obj.get("EUR1_Flag", ''))
+                                    mini_row.append(obj.get("eur1", ''))
                                 else:    
                                     mini_row.append(obj.get(ordered_key, ''))
                             except Exception as e:
