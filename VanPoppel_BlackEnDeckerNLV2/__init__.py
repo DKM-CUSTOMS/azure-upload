@@ -11,6 +11,8 @@ import uuid
 import re
 from AI_agents.Gemeni.adress_Parser import AddressParser
 from VanPoppel_BlackEnDeckerNLV2.excel.create_excel import write_to_excel
+from VanPoppel_BlackEnDeckerNLV2.clients.di_client import DILayoutClient
+from VanPoppel_BlackEnDeckerNLV2.invoice_enricher import enrich_items
 
 import tempfile
 import time
@@ -53,17 +55,28 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     result_data = None
     second_layout = False
 
-    # Select which file to process: prefer the one with "eur1" in filename
-    selected_file = None
+    # ── Separate Excel and PDF files ────────────────────────────────────────
+    excel_files = []
+    pdf_files   = []
     for file_data in files_data:
-        fname = file_data.get("filename", "")
-        if "eur1" in fname.lower():
+        fname = file_data.get("filename", "").lower()
+        ext   = os.path.splitext(fname)[1]
+        if ext in (".pdf",):
+            pdf_files.append(file_data)
+        elif ext in (".xlsx", ".xlsm", ".xls"):
+            excel_files.append(file_data)
+
+    # Select which Excel file to process: prefer the one with "eur1" in filename
+    selected_file = None
+    for file_data in excel_files:
+        if "eur1" in file_data.get("filename", "").lower():
             selected_file = file_data
             second_layout = True
             break
 
     if selected_file is None:
-        selected_file = files_data[0]
+        # Fall back to first excel, then first of any file
+        selected_file = (excel_files or files_data)[0]
 
     filename = selected_file.get("filename")
     file_content_base64 = selected_file.get("file")
@@ -226,6 +239,54 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     "Route": header_data.get("route")
                 }
 
+                # ── Enrich line items with InvoiceNumber/InvoiceDate from PDF ──
+                if pdf_files:
+                    try:
+                        logging.info(
+                            f"Running DI OCR on {len(pdf_files)} PDF file(s) "
+                            "to enrich invoice data"
+                        )
+                        di_client = DILayoutClient()
+                        combined_di = {
+                            "tables":           [],
+                            "markdown_content": ""
+                        }
+                        for pdf_file_data in pdf_files:
+                            pdf_b64  = pdf_file_data.get("file", "")
+                            pdf_name = pdf_file_data.get("filename", "invoice.pdf")
+                            if not pdf_b64:
+                                continue
+                            logging.info(f"Analysing PDF: {pdf_name}")
+                            di_result = di_client.analyze_layout(pdf_b64)
+                            combined_di["tables"].extend(di_result.get("tables", []))
+                            combined_di["markdown_content"] += (
+                                "\n" + di_result.get("markdown_content", "")
+                            )
+
+                        known_inv_str = header_data.get("invoice_number", "")
+                        known_invoices = [
+                            x.strip() for x in known_inv_str.split(",") if x.strip()
+                        ]
+
+                        enriched = enrich_items(combined_di, line_items, known_invoices)
+                        line_items = enriched
+
+                        # Log enrichment summary
+                        matched       = sum(1 for r in line_items if r.get("match_status") == "matched")
+                        force_matched = sum(1 for r in line_items if r.get("match_status") == "force_matched")
+                        ambiguous     = sum(1 for r in line_items if r.get("match_status") == "ambiguous")
+                        unresolved    = sum(1 for r in line_items if r.get("match_status") == "unresolved")
+                        logging.info(
+                            f"Invoice enrichment: {matched} matched, {force_matched} force_matched, "
+                            f"{ambiguous} ambiguous, {unresolved} unresolved "
+                            f"out of {len(line_items)} items"
+                        )
+                    except Exception as enrich_err:
+                        logging.error(
+                            f"Invoice enrichment failed: {enrich_err}",
+                            exc_info=True
+                        )
+
                 try:
                     response = call_logic_app("STANLEY", company="vp")
                     if response.get("success"):
@@ -273,6 +334,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         contact = call.send_request(role="user", prompt_text=prompt)
 
         result_data["Contact"] = contact.strip()[:10]
+        logging.error(json.dumps(result_data, indent=4))
         excel_file_bytes = write_to_excel(result_data, second_layout)
         reference = result_data.get("ShipmentReference", f"ref-{uuid.uuid4().hex}")
 
