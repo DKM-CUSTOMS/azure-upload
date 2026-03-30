@@ -185,8 +185,16 @@ def write_to_excel(json_string, second_layout=False):
             
             total = safe_float_conversion(data.get('Total Value', 0))
             eori_val = data.get('EORI', '')
+            
+            # Robust split of Route field (e.g., "NL-BE-DE" -> ["NL", "BE", "DE"])
             route_val = data.get('Route', '')
-            row6 = [total, "", eori_val, route_val]
+            route_parts = []
+            if route_val and isinstance(route_val, str):
+                route_parts = [p.strip() for p in route_val.split('-') if p.strip()]
+            else:
+                route_parts = [str(route_val or "")]
+                
+            row6 = [total, "", eori_val] + route_parts
             row6.extend([""] * max(0, len(header1) - len(row6)))
             ws.append(row6)
             ws.append([""] * len(header1))
