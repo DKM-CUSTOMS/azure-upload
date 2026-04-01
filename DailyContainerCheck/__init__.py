@@ -85,24 +85,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         # Check if DECLARATIONID exists in blob storage
         if float(declaration_id) not in existing_data["ID"].astype(float).values:
             for container in containers:
-                container_number_length = len(container)
-                if container == "...(320)":
-                    # Skip this container
-                    continue
-                # If container length is valid, check further
-                if container_number_length != 0:
-                    if container_number_length == 11 or container_number_length == 17 or container_number_length == 16:
-                        if container_number_length == 11:
-                            # Check container validity
-                            if not is_valid_container_number(container):
-                                newObj["CONTAINERS"].append(container)
-                                wrong_data.append(newObj)
-                                break  # Break after first invalid container
-                    else:
-                        # Invalid length containers
+                # Perform validation only for potential containers (length 11)
+                # Ignore all other string types (seal numbers, truck IDs, etc.)
+                if len(container) == 11:
+                    if not is_valid_container_number(container):
                         newObj["CONTAINERS"].append(container)
                         wrong_data.append(newObj)
-                        break  # Break after first invalid container
+                        break  # Stop after first invalid container found in this record
 
     try:
         return func.HttpResponse(
