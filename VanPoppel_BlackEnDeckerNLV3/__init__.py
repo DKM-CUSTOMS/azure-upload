@@ -228,7 +228,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                 "gross_weight_kg": float(gross) if gross else 0.0,
                                 "NetWeight": float(net) if net else 0.0,
                                 "Description": str(material),
-                                "eur1": "N945" if eur1_flag else ""
+                                "eur1": "N954" if eur1_flag else ""
                             })
                         except (ValueError, TypeError):
                             logging.warning(f"Skipping row {row_num} due to invalid numeric data")
@@ -297,7 +297,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                     "Origin": str(input_sheet[f"C{r}"].value or "").strip(),
                                     "Gross":  float(input_sheet[f"F{r}"].value or 0.0),
                                     "Net":    float(input_sheet[f"G{r}"].value or 0.0),
-                                    "eur1":   "N945" if (input_sheet[f"D{r}"].value not in (None, "")) else "",
+                                    "eur1":   "N954" if (input_sheet[f"D{r}"].value not in (None, "")) else "",
                                     "_used":  False,
                                 })
                             except (ValueError, TypeError):
