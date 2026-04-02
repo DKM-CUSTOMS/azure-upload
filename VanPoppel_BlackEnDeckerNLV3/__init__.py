@@ -145,6 +145,28 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                 return get_cell_value(col_value, r + 1)
                         return None
 
+                    def find_sum_by_labels(labels, col_label='J', col_value='K'):
+                        """Scan col_label for any row containing any of the `labels`.
+                        Sum the numbers extracted from col_value on those rows."""
+                        total = 0
+                        found_rows = set()
+                        for r in range(1, 100):
+                            cell_val = get_cell_value(col_label, r)
+                            if isinstance(cell_val, str):
+                                for label in labels:
+                                    if label.lower() in cell_val.lower():
+                                        # Avoid counting same row twice if multiple labels match
+                                        if r in found_rows: continue
+                                        val = get_cell_value(col_value, r)
+                                        if val is None:
+                                            val = get_cell_value(col_value, r + 1)
+                                        num = extract_number(val)
+                                        if num:
+                                            total += num
+                                            found_rows.add(r)
+                                        break # already counted this row
+                        return total if total > 0 else None
+
                     # Detect EUR1 layout (same as NL: scan all cells for "EUR1")
                     for row in sheet.iter_rows(values_only=True):
                         for cell in row:
@@ -178,14 +200,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         "country_of_destination": find_value_by_label("Country", 'J', 'K'),
                         "total_amount": find_value_by_label("Total Amount", 'J', 'K'),
                         "currency": find_value_by_label("Currency", 'J', 'K'),
-                        # Try several label variants for the collis/pallet count
-                        "pallet_info": (
-                            extract_number(find_value_by_label("Pallet", 'J', 'K'))
-                            or extract_number(find_value_by_label("Collis", 'J', 'K'))
-                            or extract_number(find_value_by_label("Carton", 'J', 'K'))
-                            or extract_number(find_value_by_label("Cartoon", 'J', 'K'))
-                            or extract_number(find_value_by_label("Box", 'J', 'K'))
-                        ),
+                        # Sum values for all collis/pallet count labels found in Column J/K
+                        "pallet_info": find_sum_by_labels(["Pallet", "Collis", "Carton", "Cartoon", "Box"], 'J', 'K'),
                         "total_gross_weight_kg": find_value_by_label("Total Gross Weight", 'J', 'K'),
                         "total_net_weight_kg": find_value_by_label("Total Net Weight", 'J', 'K'),
                         "eori": find_value_by_label("EORI", 'J', 'K'),
