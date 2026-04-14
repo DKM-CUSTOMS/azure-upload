@@ -146,8 +146,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         return None
 
                     def find_sum_by_labels(labels, col_label='J', col_value='K'):
-                        """Scan col_label for any row containing any of the `labels`.
-                        Sum the numbers extracted from col_value on those rows."""
                         total = 0
                         found_rows = set()
                         for r in range(1, 100):
@@ -155,16 +153,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                             if isinstance(cell_val, str):
                                 for label in labels:
                                     if label.lower() in cell_val.lower():
-                                        # Avoid counting same row twice if multiple labels match
                                         if r in found_rows: continue
                                         val = get_cell_value(col_value, r)
-                                        if val is None:
-                                            val = get_cell_value(col_value, r + 1)
-                                        num = extract_number(val)
+                                        num = extract_number(val) if val is not None else None
+                                        logging.error(f"[COLLIS] Row {r} | Label: '{label}' | Val: '{val}' | Num: {num}")
                                         if num:
                                             total += num
                                             found_rows.add(r)
-                                        break # already counted this row
+                                        break
+                        logging.error(f"[COLLIS] FINAL: {total}")
                         return total if total > 0 else None
 
                     # Detect EUR1 layout (same as NL: scan all cells for "EUR1")
