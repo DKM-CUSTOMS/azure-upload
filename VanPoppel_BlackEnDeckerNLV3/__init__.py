@@ -10,6 +10,7 @@ import base64
 import uuid
 import re
 from AI_agents.Gemeni.adress_Parser import AddressParser
+from bs4 import BeautifulSoup
 from VanPoppel_BlackEnDeckerNLV3.excel.create_excel import write_to_excel
 from VanPoppel_BlackEnDeckerNLV3.functions.functions import extract_clean_excel_from_pdf
 
@@ -99,10 +100,40 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     import fitz  # PyMuPDF
                     try:
                         pdf_document = fitz.open(temp_file_path)  # explicit open
+
+                        def _page_to_rows(page):
+                            """Reconstruct pipe-separated rows from HTML layout positions."""
+                            html = page.get_text("html")
+                            soup = BeautifulSoup(html, "html.parser")
+                            rows = {}
+                            for span in soup.find_all("span"):
+                                style = span.get("style", "")
+                                top_match = re.search(r"top:([\d.]+)pt", style)
+                                left_match = re.search(r"left:([\d.]+)pt", style)
+                                text = span.get_text(strip=True)
+                                if top_match and left_match and text:
+                                    y = round(float(top_match.group(1)) / 5) * 5  # bucket every 5pt = same row
+                                    rows.setdefault(y, []).append((float(left_match.group(1)), text))
+                            lines = []
+                            for y in sorted(rows):
+                                cols = [t for _, t in sorted(rows[y])]
+                                lines.append(" | ".join(cols))
+                            return "\n".join(lines)
+
                         text = ""
                         with fitz.open(temp_file_path) as doc:
-                            for page in doc:  # iterate over all pages
-                                text += page.get_text("text") + "\n"
+                            for page in doc:
+                                page_text = _page_to_rows(page)
+                                if not page_text.strip():
+                                    # fallback: HTML extraction yielded nothing, use plain text
+                                    page_text = page.get_text("text")
+                                text += page_text + "\n"
+
+                        if not text.strip():
+                            logging.error(f"PDF text extraction yielded empty result for {filename}, skipping.")
+                            continue
+
+                        logging.info(f"Extracted PDF text (first 500 chars): {text[:500]}")
                         pdf_result = extract_clean_excel_from_pdf(text)
                         pdf_results.append(pdf_result)
                     finally:
@@ -410,6 +441,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             f"Final merged {len(pdf_final_data['Items'])} items from PDF "
             "(gross_weight from Input sheet)."
         )
+
+    # Inject total Collis into the first item
+    if result_data and result_data.get("Items"):
+        result_data["Items"][0]["Collis"] = result_data.get("Collis", 0)
 
     for item in (result_data.get("Items", []) if result_data else []):
         if "InvoiceDate" in item and isinstance(item["InvoiceDate"], str):

@@ -1,4 +1,3 @@
-import ast
 import logging
 from bs4 import BeautifulSoup
 import json
@@ -149,9 +148,34 @@ def test_extract_items_from_pdf(base64_pdf: str, filename):
 def extract_clean_excel_from_pdf(doc_text: str):
 
     prompt = f"""
-Extract all invoice items from the provided text document(s) and return the results in strict JSON format as specified below.
+Extract all invoice items from the provided text and return strict JSON as specified below.
 
-JSON Structure Requirements:
+--- DOCUMENT LAYOUT ---
+
+The table has 7 columns defined across TWO header rows:
+
+  Col 1          | Col 2            | Col 3  | Col 4       | Col 5    | Col 6 | Col 7
+  Material       | Description      |        |             | Quantity | Price | Amount
+  Your Reference | Commodity code   | Origin | Net Weight  |          |       | <Currency>
+
+Each invoice ITEM spans exactly TWO consecutive data rows:
+  Row A (top):    Material number | Item description | Quantity + unit | Unit Price + currency | Amount
+  Row B (bottom): Your Reference  | Commodity code (HSCode) | Origin | Net Weight + KG
+
+Pair Row A and Row B together to build one item. Never treat them as two separate items.
+
+There are also METADATA rows injected between items. They are NOT items. They look like:
+  "Order 1000741454 date"
+  "Order 1000743622 date 13/04/2026 Your Ref. 151"
+  "Delivery 81256305 date 14/04/2026"
+
+From these metadata rows extract:
+  - InvoiceNumber: the number immediately after the word "Order"
+  - InvoiceDate:   the date immediately after the word "date" (format dd-mm-yyyy)
+  Apply the extracted InvoiceNumber and InvoiceDate to all items that follow until the next metadata row.
+
+--- JSON OUTPUT ---
+
 {{
   "Items": [
     {{
@@ -162,83 +186,46 @@ JSON Structure Requirements:
       "Origin": "string",
       "NetWeight": number,
       "Quantity": number,
-      "Amount": number,    // ALWAYS the LAST numeric value in the row located in the last column (Amount)
+      "Amount": number,
       "Currency": "string"
     }}
   ]
 }}
 
-Extraction Rules:
+--- EXTRACTION RULES ---
 
 No Omissions:
-- Extract every line item from all pages of the invoice.
-- Do not stop after a fixed number of rows.
-- If the invoice spans multiple pages, combine all items into a single JSON array.
+- Extract every line item from all pages.
+- Combine all pages into a single JSON array.
+
+Field Mapping (using the two-row structure above):
+- Description:   Row A, Col 2 — the item description text.
+- HSCode:        Row B, Col 2 — the commodity code (e.g. 8467190000).
+- Origin:        Row B, Col 3 — country of origin (e.g. CN).
+- NetWeight:     Row B, Col 4 — numeric value near "KG" (3 decimal places, e.g. 3.000).
+- Quantity:      Row A, Col 5 — numeric value (ignore the unit label e.g. EA).
+- Amount:        The VERY LAST numeric value in Row A — it is a standalone number at the end of the row with NO unit, NO currency, and NO label after it.
+
+  Row A example:  23025753 | DPN908-015 | 5 EA | Price | 830.44 EUR | 1000 EA | 4.15
+  The price section contains THREE values: the word "Price", then a unit price WITH currency (830.44 EUR), then a pack quantity WITH unit (1000 EA).
+  NONE of these are the Amount. The Amount is 4.15 — the final lone number at the end.
+
+  Rule: scan Row A from right to left. The first number you hit that has NO currency (EUR/GBP/USD) and NO unit (EA/SET/KG) after it is the Amount.
+
+- Currency:      From the Col 7 header row (e.g. EUR, GBP).
 
 Data Formatting:
-- Dates: Always use dd-mm-yyyy format.
-- Numbers:
-  - Use dots (.) for decimals (e.g., 374.00).
-  - Remove thousands separators (e.g., 10,000 → 10000).
-  - Ensure NetWeight, Quantity, UnitPrice, and Amount are numeric.
-- Currency: Always include the 3-letter currency code (e.g., GBP, USD).
-- Empty Fields: If a field (e.g., Origin) is missing, use an empty string "".
-
-Column Mapping:
-- Description: Use the item description (e.g., MFX Rivet Stainl Steel DH 4.8x30).
-- HSCode: Use the commodity code (e.g., 8308200090).
-- NetWeight: Extract the individual item weight (e.g., 12.400).
-  - Always near "KG", extract the exact one.
-  - NetWeight always has 3 digits after the decimal point.
-  - If only the total weight is provided, distribute it proportionally by quantity.
-- Amount: ALWAYS the LAST numeric value in the row (regardless of column headers). don't mix it up with UnitPrice. the UnitPrice is the numeric value with a currency before the Amount.
-  - Example: If the row ends with 0.44, that is the Amount.
+- Dates: always dd-mm-yyyy.
+- Decimals: use dot (.) — e.g. 374.00.
+- Remove thousands separators (10,000 → 10000).
+- Missing fields: use "".
 
 Validation:
 - Do not calculate or derive values.
 - Do not cross-check Quantity × UnitPrice = Amount.
-- If the document is unclear, flag ambiguous fields with "".
 
 Output:
-- Return only valid JSON — no explanations, notes, or placeholders.
-- If unclear, flag ambiguous fields with "".
-
-Example Output:
-{{
-  "Items": [
-    {{
-      "InvoiceNumber": "",
-      "InvoiceDate": "",
-      "Description": "",
-      "HSCode": "",
-      "Origin": "",
-      "NetWeight": 0.000,
-      "Quantity": 0,
-      "Amount": 0.00,
-      "Currency": ""
-    }},
-    {{
-      "InvoiceNumber": "",
-      "InvoiceDate": "",
-      "Description": "",
-      "HSCode": "",
-      "Origin": "",
-      "NetWeight": 0.000,
-      "Quantity": 0,
-      "Amount": 0.00,
-      "Currency": ""
-    }}
-  ]
-}}
-
-Key Clarifications:
-- Amount is always the last numeric value in the row.
-- Do not mix it up with UnitPrice.
-- UnitPrice is the numeric value with a currency before the Amount.
-- Amount is the last numeric value in the row and does not include a currency (currency is in the header).
-- Do not put UnitPrice in the Amount field.
-- You may check the total amount at the bottom of the invoice to confirm extraction.
-- If the invoice has multiple pages, extract all items into a single JSON array.
+- Return only valid JSON — no explanations, markdown, or placeholders.
 
 Document text:
 {doc_text}
@@ -247,6 +234,6 @@ Document text:
     call = CustomCall()
     extracted_items = call.send_request("user", prompt)
     extracted_items = extracted_items.replace("```", "").replace("json", "").strip()
-    extracted_items = ast.literal_eval(extracted_items)
-    
+    extracted_items = json.loads(extracted_items)
+
     return extracted_items
