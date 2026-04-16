@@ -21,10 +21,17 @@ TARGET_USERS = list(dict.fromkeys(IMPORT_USERS + EXPORT_USERS)) # Unique list fo
 MANUAL_STATUSES = {"COPIED", "COPY", "NEW"}
 SENDING_STATUSES = {"DEC_DAT"}
 SYSTEM_USERS = {"BATCHPROC", "ADMIN", "SYSTEM", "BATCH_PROC"} # Unified system user identification
+CREATION_STATUSES = MANUAL_STATUSES | {"INTERFACE"}
 
 # --- Helper Functions ---
 
-def classify_file_activity(global_history: List[str], user_history: List[str] = None, group_df=None, target_user: str = None) -> Tuple[bool, bool]:
+def classify_file_activity(
+    global_history: List[str],
+    user_history: List[str] = None,
+    group_df=None,
+    target_user: str = None,
+    prefer_creation_status_owner: bool = False
+) -> Tuple[bool, bool]:
     """
     Determines if a file activity is 'Automatic' or 'Manual'.
     
@@ -41,6 +48,9 @@ def classify_file_activity(global_history: List[str], user_history: List[str] = 
         user_history: Specific history of the user being analyzed. If None, defaults to global_history.
         group_df: DataFrame of the entire file history (needed for BATCHPROC logic).
         target_user: The user being analyzed (needed for BATCHPROC logic).
+        prefer_creation_status_owner: When True, ownership is based on the first
+            creation signal row (NEW/COPY/COPIED/INTERFACE) instead of the first
+            history row. Falls back to the first history row if no creation signal exists.
     
     Returns:
         A tuple (is_manual, is_automatic)
@@ -50,7 +60,7 @@ def classify_file_activity(global_history: List[str], user_history: List[str] = 
     global_set = set(global_history)
     
     # Check for starting point: if missing, completely ignore for creation calculations
-    if not {"INTERFACE", "NEW", "COPIED", "COPY"}.intersection(global_set):
+    if not CREATION_STATUSES.intersection(global_set):
         return False, False
         
     user_set = set(user_history) if user_history is not None else global_set
@@ -62,8 +72,16 @@ def classify_file_activity(global_history: List[str], user_history: List[str] = 
         # Sort by time to get the first action
         sorted_group = group_df.sort_values('HISTORYDATETIME')
         if not sorted_group.empty:
-            first_user = str(sorted_group.iloc[0]['USERCODE']).upper()
-            if first_user in SYSTEM_USERS:
+            owner_row = sorted_group.iloc[0]
+            if prefer_creation_status_owner and 'HISTORY_STATUS' in sorted_group.columns:
+                creation_rows = sorted_group[
+                    sorted_group['HISTORY_STATUS'].astype(str).str.upper().isin(CREATION_STATUSES)
+                ]
+                if not creation_rows.empty:
+                    owner_row = creation_rows.iloc[0]
+
+            owner_user = str(owner_row['USERCODE']).upper()
+            if owner_user in SYSTEM_USERS:
                 is_automatic = True  # It's an automated file
                 
                 # Check if ANY human (non-system user) interacted with it
@@ -98,7 +116,7 @@ def classify_file_activity(global_history: List[str], user_history: List[str] = 
                     return False, False
             else:
                 # A human created the file. Only the creator gets creation credit.
-                if target_user.upper() != first_user:
+                if target_user.upper() != owner_user:
                     return False, False
                     
     

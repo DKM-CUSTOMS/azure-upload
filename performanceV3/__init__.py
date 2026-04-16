@@ -743,7 +743,8 @@ def _compute_rich_user_metrics(df: pd.DataFrame, username: str) -> dict:
             global_history=global_statuses,
             user_history=user_statuses,
             group_df=group,
-            target_user=username_upper
+            target_user=username_upper,
+            prefer_creation_status_owner=True
         )
 
         # Date of user's FIRST action on this declaration
@@ -770,11 +771,15 @@ def _compute_rich_user_metrics(df: pd.DataFrame, username: str) -> dict:
                     daily_data[day_str]["modification_file_ids"].append(decl_id)
             total_modifications += len(user_mods)
 
-        # Deletion tracking: did this user delete this declaration?
-        # Runs AFTER classification so we know if it was their own file or not
-        if "DELETED" in user_statuses:
-            deletion_rows = user_decl_rows[user_decl_rows["HISTORY_STATUS"] == "DELETED"]
-            deletion_date = deletion_rows["HISTORYDATETIME"].min().date().isoformat()
+        # Deletion tracking: a file counts as deleted only when the FINAL
+        # status in the declaration history is DELETED. Credit goes only to
+        # the user who performed that final deletion event.
+        final_row = group.iloc[-1]
+        final_status = str(final_row["HISTORY_STATUS"]).upper()
+        final_user = str(final_row["USERCODE"]).upper()
+
+        if final_status == "DELETED" and final_user == username_upper:
+            deletion_date = final_row["HISTORYDATETIME"].date().isoformat()
 
             total_deletions += 1
             daily_data[deletion_date]["deleted_file_ids"].append(decl_id)
@@ -1128,7 +1133,8 @@ def refresh_10day(req: func.HttpRequest) -> func.HttpResponse:
                 global_history=group["HISTORY_STATUS"].tolist(),
                 user_history=user_rows["HISTORY_STATUS"].tolist(),
                 group_df=group,
-                target_user=user
+                target_user=user,
+                prefer_creation_status_owner=True
             )
 
             if is_manual or is_automatic:
