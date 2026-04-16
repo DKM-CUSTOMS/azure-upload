@@ -164,15 +164,38 @@ Each invoice ITEM spans exactly TWO consecutive data rows:
 
 Pair Row A and Row B together to build one item. Never treat them as two separate items.
 
-There are also METADATA rows injected between items. They are NOT items. They look like:
+--- INVOICE HEADER (top of the document, before items) ---
+
+Near the top of the document there is a small table with three column headers on one line
+followed by three values on the next line. It looks like this:
+
+  Number | Date | Page
+  9600005448 | 17/04/2026 | 1/2
+
+The exact label words may vary slightly (e.g. "Number", "No.", "Invoice No", "Numéro").
+The date column label is always "Date" or similar.
+
+Rule: find the line that contains ONLY labels "Number" (or similar) and "Date" (or similar).
+The VERY NEXT line contains the corresponding values.
+  - The value under "Number" = InvoiceNumber  (e.g. "9600005448")
+  - The value under "Date"   = InvoiceDate    (e.g. "17/04/2026", convert to dd-mm-yyyy)
+
+Use these as the DOCUMENT-LEVEL InvoiceNumber and InvoiceDate and apply them to ALL items.
+This is the PRIMARY source. Only override per-item if a specific "Order" metadata row
+(see below) supplies a different number/date for that group.
+
+--- ORDER / DELIVERY METADATA ROWS ---
+
+There are metadata rows injected between items that look like:
   "Order 1000741454 date"
   "Order 1000743622 date 13/04/2026 Your Ref. 151"
   "Delivery 81256305 date 14/04/2026"
 
-From these metadata rows extract:
-  - InvoiceNumber: the number immediately after the word "Order"
-  - InvoiceDate:   the date immediately after the word "date" (format dd-mm-yyyy)
-  Apply the extracted InvoiceNumber and InvoiceDate to all items that follow until the next metadata row.
+These rows are NOT items and must be SKIPPED entirely during extraction.
+Do NOT use any number or date from these rows — they are internal order references,
+not the invoice number or invoice date.
+The InvoiceNumber and InvoiceDate for every item always come exclusively from the
+document-level header table described above.
 
 --- JSON OUTPUT ---
 

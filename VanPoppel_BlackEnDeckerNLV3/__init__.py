@@ -228,6 +228,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         "country_of_destination": find_value_by_label("Country", 'J', 'K'),
                         "total_amount": find_value_by_label("Total Amount", 'J', 'K'),
                         "currency": find_value_by_label("Currency", 'J', 'K'),
+                        "invoice_date": find_value_by_label("Invoice Date", 'J', 'K') or find_value_by_label("Date", 'J', 'K'),
                         # Sum values for all collis/pallet count labels found in Column J/K
                         "pallet_info": find_sum_by_labels(["Pallet", "Collis", "Carton", "Cartoon", "Box"], 'J', 'K'),
                         "total_gross_weight_kg": find_value_by_label("Total Gross Weight", 'J', 'K'),
@@ -312,6 +313,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         "OfficeOfExit": header_data.get("office_of_exit"),
                         "PlaceOfDelivery": parsed_address,
                         "Invoice No": header_data.get("invoice_number"),
+                        "Invoice Date": header_data.get("invoice_date"),
                         "Items": line_items,
                         "EORI": header_data.get("eori"),
                         "Route": header_data.get("route"),
@@ -442,9 +444,25 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "(gross_weight from Input sheet)."
         )
 
-    # Inject total Collis into the first item
-    if result_data and result_data.get("Items"):
-        result_data["Items"][0]["Collis"] = result_data.get("Collis", 0)
+    # --- Backfill empty InvoiceNumber / InvoiceDate from Excel header ---
+    # The PDF AI extracts these per item, but the invoice number often only
+    # appears in the PDF header section and not on every line row.
+    # If an item came back with empty InvoiceNumber, fill it from the Excel header.
+    if result_data:
+        header_inv_no   = result_data.get("Invoice No", "") or ""
+        header_inv_date = result_data.get("Invoice Date", "") or ""
+        
+        # If it's a datetime object from Excel, format it to YYYY-MM-DD
+        if isinstance(header_inv_date, datetime):
+            header_inv_date = header_inv_date.strftime("%Y-%m-%d")
+        else:
+            header_inv_date = str(header_inv_date).split(" ")[0] if header_inv_date else ""
+
+        for item in result_data.get("Items", []):
+            if not item.get("InvoiceNumber"):
+                item["InvoiceNumber"] = header_inv_no
+            if not item.get("InvoiceDate"):
+                item["InvoiceDate"] = header_inv_date
 
     for item in (result_data.get("Items", []) if result_data else []):
         if "InvoiceDate" in item and isinstance(item["InvoiceDate"], str):
@@ -457,6 +475,18 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             else:
                 # Already yyyy-mm-dd or unknown format — keep as-is
                 item["InvoiceDate"] = raw_date
+
+    # --- Assign total gross weight to the single zero-gross item ---
+    # If exactly one item has gross_weight_kg == 0 (PDF didn't extract it),
+    # assign the header total gross weight to that item.
+    if result_data:
+        items = result_data.get("Items", [])
+        zero_gross = [item for item in items if not float(item.get("gross_weight_kg") or 0)]
+        if len(zero_gross) == 1:
+            total_gross = safe_float(result_data.get("GrossWeight", 0))
+            if total_gross > 0:
+                zero_gross[0]["gross_weight_kg"] = total_gross
+                logging.info(f"Assigned total gross {total_gross} to single zero-gross item.")
 
     # --- Build Response ---
     if not result_data:

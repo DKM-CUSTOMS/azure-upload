@@ -162,6 +162,12 @@ def write_to_excel(json_string, second_layout=False):
 
             rows_data.sort(key=hs_key)
 
+            # Inject total Collis into the FIRST item row (index 3 = "Collis" column)
+            # MUST happen after sort so it always lands on the first visible row.
+            total_pallets_per_item = safe_float_conversion(data.get('Collis', 0))
+            if rows_data:
+                rows_data[0][3] = total_pallets_per_item
+
             logger.info(f"Processed {len(rows_data)} item rows (sorted by HS code)")
         except Exception as e:
             logger.error(f"Error processing items: {str(e)}")
