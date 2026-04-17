@@ -235,6 +235,17 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         os.remove(uploaded_file_path)
     
     result = process_invoice_data(invoices_data_and_type)
+
+    # If the Voorblad model did not return the Bleckmann ID, fall back to the
+    # merged invoice reference so the Excel and download filename still have a ref.
+    if not result.get("Reference"):
+        fallback_reference = result.get("inv Reference", "")
+        if fallback_reference:
+            result["Reference"] = fallback_reference
+            logging.warning(
+                "Bleckmann Reference missing from Voorblad ID; falling back to invoice reference '%s'.",
+                fallback_reference
+            )
     
     
     try:
