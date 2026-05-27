@@ -49,6 +49,10 @@ def extract_key_value_pairs(text):
     if current_key:
         key_value_pairs[current_key] = " ".join(current_value).strip() if current_value else ""
 
+    # Remove space after colon in AEO nummer (e.g. "Y022: BE..." -> "Y022:BE...")
+    if "AEO nummer" in key_value_pairs:
+        key_value_pairs["AEO nummer"] = re.sub(r':\s+', ':', key_value_pairs["AEO nummer"])
+
     return key_value_pairs
 
 def extract_text_from_pdf(pdf_path):

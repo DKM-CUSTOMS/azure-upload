@@ -190,7 +190,7 @@ def write_to_excel(json_string, second_layout=False):
             ws.append(row5)
             
             total = safe_float_conversion(data.get('Total Value', 0))
-            eori_val = data.get('EORI', '')
+            eori_val = (data.get('EORI', '') or '').replace(' ', '')
             
             # Robust split of Route field (e.g., "NL-BE-DE" -> ["NL", "BE", "DE"])
             route_val = data.get('Route', '')
