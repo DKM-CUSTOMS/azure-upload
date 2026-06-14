@@ -1,7 +1,31 @@
 {
   "permissions": {
     "allow": [
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(az account *)",
+      "Bash(az login *)",
+      "Bash(az keyvault *)",
+      "Bash(python -m compileall -q . -x \".venv\")",
+      "Bash(az functionapp *)",
+      "Bash(py -3.11 --version)",
+      "Bash(py -3.12 --version)",
+      "Bash(py -0)",
+      "Bash(az monitor *)",
+      "Bash(az config *)",
+      "Bash(az extension *)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(r[0][:19], '|', r[1][:300]\\) for r in d['tables'][0]['rows']]\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\('|', r[1][:400]\\) for r in d['tables'][0]['rows']]\")",
+      "Bash(curl -s -H 'Authorization: Bearer __TRACKED_VAR__' https://functionapp-python-pdf.scm.azurewebsites.net/api/vfs/site/wwwroot/)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); rows=d['tables'][0]['rows']; print\\('NONE' if not rows else ''\\); [print\\(r[0][:19],'|',r[1]\\) for r in rows]\")",
+      "Bash(echo \"restart issued: exit $?\")",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code} in %{time_total}s\\\\n\" \"https://functionapp-python-pdf.azurewebsites.net/\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); rows=d['tables'][0]['rows']; print\\('\\(none\\)' if not rows else ''\\); [print\\(r[0][:19],'|',r[1]\\) for r in rows]\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(r[0]\\) for r in d['tables'][0]['rows']]\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); rows=d['tables'][0]['rows']; print\\('\\(none\\)' if not rows else ''\\); [print\\('-',r[0]\\) for r in rows]\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(python -m py_compile performanceV3/__init__.py)",
+      "Bash(python3 -m py_compile performanceV3/__init__.py)",
+      "Bash(python -c \"import json; json.load\\(open\\('performanceV3/function.json'\\)\\); print\\('FUNCTION_JSON_OK'\\)\")"
     ]
   }
 }

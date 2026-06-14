@@ -9,8 +9,11 @@ import fitz
 from AI_agents.Gemeni.adress_Parser import AddressParser
 from AI_agents.OpenAI.custom_call import CustomCall
 from ILS_NUMBER.get_ils_number import call_logic_app
-from VanPoppel_Arte.helpers.extractors import extract_customs_authorization_no, extract_customs_code, extract_invoice_meta_and_shipping, extract_products_from_text, extract_totals_and_incoterm, find_page_in_invoice
+from global_db.functions.numbers.number_format import detect_format
+from VanPoppel_Arte.helpers.extractors import collect_numeric_strings, extract_customs_authorization_no, extract_customs_code, extract_invoice_meta_and_shipping, extract_products_from_text, extract_totals_and_incoterm, find_page_in_invoice
 from VanPoppel_Arte.helpers.functions import clean_invoice_items, extract_email_body, merge_invoice_outputs, safe_float_conversion, safe_int_conversion
+from VanPoppel_Arte.helpers.validation import validate_invoice, is_valid_incoterm
+from VanPoppel_Arte.helpers.ai_rescue import rescue_invoice
 from VanPoppel_Arte.excel.create_excel import write_to_excel
 
 
@@ -40,6 +43,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
     
     combined_data = []
+    warnings = []
 
     for file_info in files:
         file_content_base64 = file_info.get('file')
@@ -95,20 +99,66 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         header_inv_data["billing_address"] = parsed_result2
         
         # ----------------------------------------
-        # 🔸 Extract item lines from all pages
+        # 🔸 Extract item lines from all pages (standard parser — the 80% path)
         # ----------------------------------------
         all_items = []
+        doc_dropped = []
         for page in doc:
             page_text = page.get_text()
-            page_items = extract_products_from_text(page_text)
+            page_items, page_dropped = extract_products_from_text(page_text)
             all_items.extend(page_items)
-        
+            doc_dropped.extend(page_dropped)
+
         # ----------------------------------------
-        # 🔹 Extract Footer info from last page
+        # 🔹 Extract Footer info — Arte spreads it over pages (Incoterms on one
+        #    page, totals on another), so search the WHOLE document text
         # ----------------------------------------
-        page = find_page_in_invoice(doc)
-        last_page_text = doc[page[0]-1].get_text()
-        footer_inv_data = extract_totals_and_incoterm(last_page_text)
+        full_text = "\n\n".join(p.get_text() for p in doc)
+
+        # number format (EU vs US separators) decided once per document from
+        # all its numeric strings, then applied consistently to every value
+        doc_fmt = detect_format(collect_numeric_strings(all_items, full_text), default="US")
+        logging.info(f"{filename}: detected {doc_fmt} number format")
+
+        footer_inv_data = extract_totals_and_incoterm(full_text, doc_fmt)
+
+        # ----------------------------------------
+        # 🔹 Validation gates: checksum (items+transport == total), completeness
+        #    (HS code/amount/price/net per item) and incoterm vocabulary.
+        #    Documents that pass keep the standard parser output untouched.
+        #    Documents that fail are re-extracted by AI — accepted ONLY if the
+        #    AI output passes the very same gates.
+        # ----------------------------------------
+        problems = validate_invoice(all_items, footer_inv_data, doc_fmt)
+        if problems:
+            logging.warning(f"{filename}: extraction failed validation: {problems}")
+            try:
+                rescued = rescue_invoice(full_text, problems)
+                rescued_items = rescued.get("items") or []
+                rescued_footer = rescued.get("footer") or {}
+                rescued_problems = validate_invoice(rescued_items, rescued_footer, doc_fmt)
+                if not rescued_problems:
+                    all_items = rescued_items
+                    footer_inv_data = rescued_footer
+                    doc_dropped = []
+                    problems = []
+                    warnings.append(f"{filename}: standard parser output was incomplete; "
+                                    f"AI re-extraction used ({len(rescued_items)} items, passed all validation checks)")
+                elif is_valid_incoterm(rescued_footer.get("incoterm")) and not is_valid_incoterm(footer_inv_data.get("incoterm")):
+                    # partial acceptance: a vocabulary-valid incoterm only
+                    footer_inv_data["incoterm"] = rescued_footer["incoterm"]
+                    problems = [p for p in problems if "incoterm" not in p.lower()]
+                    warnings.append(f"{filename}: incoterm recovered by AI re-extraction: {rescued_footer['incoterm']}")
+            except Exception as e:
+                logging.error(f"AI rescue failed for {filename}: {e}")
+
+        if doc_dropped and problems:
+            warnings.append(f"{filename}: product line(s) {', '.join(doc_dropped)} could not be parsed "
+                            f"and may be MISSING from the Excel — check them manually")
+        warnings.extend(f"{filename}: {p}" for p in problems)
+
+        for item in all_items:
+            item["_fmt"] = doc_fmt
         
         # ----------------------------------------
         # 🔹 Extract Customs Code info from last page
@@ -118,8 +168,12 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         try:
             customs_page_text = doc[page[0]-1].get_text()
             customs_no = extract_customs_code(customs_page_text)
+            if customs_no in ("NOT_FOUND", "EXTRACTION_FAILED"):
+                customs_no = None
         except:
             logging.error("Customs authorization number not found or page extraction failed.")
+        if not customs_no:
+            warnings.append(f"{filename}: no customs authorization / declaration of origin found")
             
             
         # ----------------------------------------
@@ -214,13 +268,25 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     email_data = json.loads(email_data)
     
     combined_result, TotalNetWeight, TotalSurface, TotalQuantity = clean_invoice_items(combined_result)
-    
+
     combined_result["Totals"] = {
         "TotalNetWeight": round(TotalNetWeight, 3),
         "TotalSurface": round(TotalSurface, 3),
         "TotalQuantity": round(TotalQuantity, 3)
     }
     combined_result["email_data"] = email_data
+
+    # cross-check: item amounts (+ transport) must add up to the invoice total
+    items_amount_sum = sum(i.get("amount") or 0 for i in combined_result.get("items", []))
+    footer_total = combined_result.get("footer", {}).get("total") or 0
+    transport_total = combined_result.get("footer", {}).get("transport") or 0
+    if footer_total and abs(items_amount_sum + transport_total - footer_total) > 0.05:
+        warnings.append(f"sum of item amounts ({items_amount_sum:.2f}) + transport ({transport_total:.2f}) "
+                        f"does not match invoice total ({footer_total:.2f}) — items may be missing or values wrong")
+    if combined_result.get("items") and TotalNetWeight == 0:
+        warnings.append("total net weight is 0 — weight extraction may have failed")
+    if warnings:
+        logging.warning(f"Validation warnings: {warnings}")
     
     try:
         # Get the ILS number
@@ -237,13 +303,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     
     # Proceed with data processing
     try:
-        excel_file= write_to_excel(combined_result)
-        reference = combined_result.get("header").get("document_number")
+        excel_file = write_to_excel(combined_result, warnings)
+        reference = combined_result.get("header").get("document_number") or "document"
 
         # Set response headers for the Excel file download
         headers = {
             'Content-Disposition': 'attachment; filename="' + reference + '.xlsx"',
-            'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'x-validation': 'warnings' if warnings else 'ok'
         }
 
         # Return the Excel file as an HTTP response

@@ -3,7 +3,7 @@ import logging
 import openpyxl
 
 
-def write_to_excel(json_string):
+def write_to_excel(json_string, warnings=None):
     # Create a new workbook and select the active sheet
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -37,13 +37,21 @@ def write_to_excel(json_string):
     totalsdata = data.get('Totals', {} )
     email_data = data.get('email_data', {} )
     
-    name, street, city, code_postal, country = headerdata.get('address')
-
-    if footerdata.get('incoterm', ['', '']) is not None:
-        if len(footerdata.get('incoterm', ['', ''])) > 1:
-            term, place = footerdata.get('incoterm', ['', '']).split(' ', 1)
+    address = headerdata.get('address')
+    if not isinstance(address, (list, tuple)) or len(address) != 5:
+        if isinstance(address, (list, tuple)):
+            address = (list(address) + [""] * 5)[:5]
         else:
-            term, place =['', '']
+            address = [str(address or ""), "", "", "", ""]
+    name, street, city, code_postal, country = address
+
+    incoterm_value = footerdata.get('incoterm') or ""
+    if isinstance(incoterm_value, str) and incoterm_value.strip():
+        incoterm_parts = incoterm_value.split(' ', 1)
+        term = incoterm_parts[0]
+        place = incoterm_parts[1] if len(incoterm_parts) > 1 else ''
+    else:
+        term, place = '', ''
 
     values1 = [
         data.get('Vat', ''),
@@ -171,6 +179,14 @@ def write_to_excel(json_string):
                 pass
         adjusted_width = (max_length + 2)
         ws.column_dimensions[column].width = adjusted_width
+
+    # Validation warnings on a separate sheet so the main layout stays untouched
+    if warnings:
+        ws_warn = wb.create_sheet("Warnings")
+        ws_warn.append(["Validation warnings - please double-check against the source documents"])
+        for warning in warnings:
+            ws_warn.append([warning])
+        ws_warn.column_dimensions["A"].width = 120
 
     # Save the workbook to a BytesIO object (in memory)
     file_stream = BytesIO()

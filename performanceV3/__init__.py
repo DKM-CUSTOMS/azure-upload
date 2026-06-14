@@ -1,34 +1,29 @@
 """
 performanceV3 - Azure Function
 ==============================
-New data architecture that eliminates memory crashes on Azure consumption plan.
+Data architecture that avoids memory crashes on the Azure Consumption plan by
+pre-computing everything into small cache files. The GET endpoints serve those
+caches instantly with no calculation at request time.
 
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  LIVE (every 2 hours) — triggered by Logic App after blob upload            ║
-║    POST /refresh-hot                                                        ║
-║      1. Read only the NEW 2h JSON landing file (sent as body or auto-detect)║
-║      2. Merge into today's daily parquet (upsert by DECLARATIONID)          ║
-║      3. Update file index — only for declarations in new data               ║
-║      4. Rebuild 10-day summary cache (10 small daily parquets ~10 MB each)  ║
-║      5. Rebuild user caches — only for users that appear in the new data    ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  DAILY (2 AM cold rebuild)                                                  ║
-║    POST /
-transform-daily → /build-index → /refresh-monthly → /refresh      ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  INSTANT GET endpoints (always read from cache — no calculation)            ║
-║    GET /           → 10-day summary cache                                   ║
-║    GET ?user=X     → per-user cache                                         ║
-║    GET ?all_users  → monthly report cache                                   ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+DAILY cold rebuild (run on a schedule, e.g. 2 AM):
+    POST /transform-daily        raw landing JSON   -> one daily parquet
+    POST /build-index            all daily parquets -> file_index.parquet
+    POST /refresh-users          all daily parquets -> per-user caches (single pass)
+    POST /refresh                last 10 working days -> 10-day summary cache
 
-Memory budget per refresh-hot call:
-  New 2h JSON      : ~5–20 MB
-  Today's parquet  : ~10–50 MB   (read + re-write)
-  File index       : ~50 MB      (read + patch + re-write)
-  10-day parquets  : ~10x10 MB   (read only)
-  User cache write : ~1 MB each  (only affected users)
-  TOTAL            : ~200 MB     ✅ safe on consumption plan
+  Backfill helper:
+    POST /transform-daily-range?start=YYYY-MM-DD&end=YYYY-MM-DD  (idempotent, resumable)
+
+INSTANT GET endpoints (always read from cache — no calculation):
+    GET /                        -> 10-day summary cache
+    GET ?user=X                  -> per-user cache
+    GET users                    -> discovered users (from the index)
+    GET file-lifecycle?id=...    -> single declaration trace
+
+Performance model: every heavy job reads each data file exactly once (parallel,
+column-pruned) and computes all users in a single pass. All jobs only READ
+landing/transformed data and WRITE regenerable caches/index — source landing
+JSON and daily parquets are never modified.
 """
 
 from collections import defaultdict
@@ -38,6 +33,8 @@ import logging
 import json
 import io
 import pandas as pd
+import pyarrow.parquet as pq
+from concurrent.futures import ThreadPoolExecutor
 from azure.storage.blob import BlobServiceClient, ContainerClient
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
@@ -63,11 +60,17 @@ INDEX_BLOB_PATH = f"{BLOB_BASE}/index/file_index.parquet"
 
 # Cache paths (instant-read endpoints)
 SUMMARY_BLOB_PATH = f"Dashboard/cache/users_summaryV3.json"
-MONTHLY_SUMMARY_BLOB_PATH = f"Dashboard/cache/monthly_report_cacheV3.json"
 USER_CACHE_PATH_PREFIX = "Dashboard/cache/usersV3/"
 
 # Import declaration types — used to determine team membership
 IMPORT_TYPES = {"DMS_IMPORT", "IDMS_IMPORT"}
+
+# Columns required by every analytics computation. Used for column-pruned parquet
+# reads so we download/hold only what we need (big memory + I/O win on full scans).
+NEEDED_COLS = [
+    "DECLARATIONID", "USERCODE", "HISTORY_STATUS", "HISTORYDATETIME",
+    "ACTIVECOMPANY", "TYPEDECLARATIONSSW", "PRINCIPAL",
+]
 
 # ---------------------------------------------------------------------------
 # Azure Services Initialization
@@ -92,13 +95,25 @@ def _blob_client(path: str):
 
 
 def _read_parquet(path: str, columns=None) -> pd.DataFrame:
-    """Read a single parquet file from blob storage into a DataFrame."""
+    """Read a single parquet file from blob storage into a DataFrame.
+
+    When ``columns`` is provided, only the requested columns that actually exist
+    in the file are read (column-pruned read) — this drastically cuts download
+    size and memory. Columns missing from the file are ignored, so callers may
+    safely pass a superset.
+    """
     bc = _blob_client(path)
     if not bc.exists():
         logging.warning(f"Parquet not found: {path}")
         return pd.DataFrame()
     data = bc.download_blob().readall()
-    return pd.read_parquet(io.BytesIO(data), columns=columns)
+    buf = io.BytesIO(data)
+    if columns:
+        available = set(pq.read_schema(buf).names)
+        cols = [c for c in columns if c in available]
+        buf.seek(0)
+        return pd.read_parquet(buf, columns=cols)
+    return pd.read_parquet(buf)
 
 
 def _write_parquet(df: pd.DataFrame, path: str):
@@ -127,6 +142,62 @@ def _list_blobs(prefix: str):
     """Return list of blob names under a given prefix."""
     container: ContainerClient = blob_service_client.get_container_client(CONTAINER_NAME)
     return [b.name for b in container.list_blobs(name_starts_with=prefix)]
+
+
+def _download_json_frames(blob_names: list) -> list:
+    """Download and parse many landing JSON blobs in parallel.
+
+    Returns a list of DataFrames (one per non-empty blob) in the SAME order as
+    ``blob_names`` so downstream concat/dedup behaves exactly like the previous
+    sequential version — only faster (downloads run concurrently).
+    """
+    if not blob_names:
+        return []
+
+    def _load(blob_name):
+        try:
+            raw = _blob_client(blob_name).download_blob().readall()
+            records = json.loads(raw)
+            if isinstance(records, list) and records:
+                return pd.DataFrame(records)
+        except Exception as e:
+            logging.error(f"Failed to read blob {blob_name}: {e}")
+        return None
+
+    frames = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for df in ex.map(_load, blob_names):
+            if df is not None:
+                frames.append(df)
+    return frames
+
+
+def _read_all_transformed_df(columns=None) -> pd.DataFrame:
+    """Read every transformed daily parquet once, in parallel, into one frame.
+
+    Reads are column-pruned (via ``columns``) and run concurrently, but results
+    are concatenated in blob-name order so any tie-break-sensitive downstream
+    logic (e.g. stable sorts on equal timestamps) stays deterministic.
+    """
+    parquet_blobs = [b for b in _list_blobs(TRANSFORMED_PREFIX) if b.endswith(".parquet")]
+    if not parquet_blobs:
+        return pd.DataFrame()
+
+    def _load(blob_name):
+        try:
+            return _read_parquet(blob_name, columns=columns)
+        except Exception as e:
+            logging.error(f"Failed to read parquet {blob_name}: {e}")
+            return None
+
+    frames = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for df in ex.map(_load, parquet_blobs):
+            if df is not None and not df.empty:
+                frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -195,15 +266,7 @@ def transform_daily(req: func.HttpRequest) -> func.HttpResponse:
 
     logging.info(f"transform-daily: found {len(json_blobs)} JSON files for {target_date}")
 
-    frames = []
-    for blob_name in json_blobs:
-        try:
-            raw = _blob_client(blob_name).download_blob().readall()
-            records = json.loads(raw)
-            if isinstance(records, list) and records:
-                frames.append(pd.DataFrame(records))
-        except Exception as e:
-            logging.error(f"Failed to read blob {blob_name}: {e}")
+    frames = _download_json_frames(json_blobs)
 
     if not frames:
         return func.HttpResponse(
@@ -266,15 +329,7 @@ def _transform_one_day(target_date, force: bool) -> dict:
     if not json_blobs:
         return {"date": date_str, "status": "no_data", "reason": "no landing JSON files found"}
 
-    frames = []
-    for blob_name in json_blobs:
-        try:
-            raw = _blob_client(blob_name).download_blob().readall()
-            records = json.loads(raw)
-            if isinstance(records, list) and records:
-                frames.append(pd.DataFrame(records))
-        except Exception as e:
-            logging.error(f"transform-range: failed to read {blob_name}: {e}")
+    frames = _download_json_frames(json_blobs)
 
     if not frames:
         return {"date": date_str, "status": "no_data", "reason": "all JSON files were empty or unreadable"}
@@ -383,8 +438,7 @@ def build_index(req: func.HttpRequest) -> func.HttpResponse:
     """
     logging.info("build-index: starting full scan of transformed parquet files")
 
-    all_parquet_blobs = _list_blobs(TRANSFORMED_PREFIX)
-    parquet_blobs = [b for b in all_parquet_blobs if b.endswith(".parquet")]
+    parquet_blobs = [b for b in _list_blobs(TRANSFORMED_PREFIX) if b.endswith(".parquet")]
 
     if not parquet_blobs:
         return func.HttpResponse(
@@ -392,22 +446,15 @@ def build_index(req: func.HttpRequest) -> func.HttpResponse:
             status_code=200, mimetype="application/json"
         )
 
-    logging.info(f"build-index: loading {len(parquet_blobs)} parquet files")
+    logging.info(f"build-index: loading {len(parquet_blobs)} parquet files (parallel, column-pruned)")
 
-    frames = []
-    for blob_name in parquet_blobs:
-        try:
-            frames.append(_read_parquet(blob_name))
-        except Exception as e:
-            logging.error(f"Failed to read parquet {blob_name}: {e}")
+    df = _read_all_transformed_df(columns=NEEDED_COLS)
 
-    if not frames:
+    if df.empty:
         return func.HttpResponse(
             json.dumps({"error": "Could not read any transformed parquet files."}),
             status_code=500, mimetype="application/json"
         )
-
-    df = pd.concat(frames, ignore_index=True)
 
     # Standardise
     for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
@@ -507,100 +554,63 @@ def build_index(req: func.HttpRequest) -> func.HttpResponse:
 # ===========================================================================
 # ROUTE 3 – POST /refresh-users
 # ===========================================================================
-# Strategy: index is used ONLY to find which declarations each user is in
-# and their date range. Then we load daily parquets ONE AT A TIME, filter
-# immediately to only that user's declarations, and discard each full parquet.
-# At any moment we hold at most one daily parquet (~10-20 MB) in memory.
-# The resulting per-user DataFrame is small (~few MB) and we compute the
-# full rich metrics from it — matching the exact V2 output format.
+# Single-pass strategy: read ALL transformed daily parquets ONCE (column-pruned,
+# in parallel), then slice that in-memory frame per user and feed each slice to
+# the UNCHANGED _compute_rich_user_metrics. This produces byte-identical output
+# to the previous per-user version but downloads each parquet once instead of
+# once per user (the old path re-read the same ~40 files for every user).
 # ===========================================================================
 
-def _discover_all_users(index_df: pd.DataFrame) -> list:
-    """
-    Extract all unique human USERCODE values from the index.
-    Returns a sorted list of usernames, excluding system users.
-    """
-    all_users = set()
-    for user_list in index_df["users"]:
-        if isinstance(user_list, list):
-            for u in user_list:
-                u_upper = u.upper().strip()
-                if u_upper and u_upper not in SYSTEM_USERS and u_upper not in ("NAN", "NONE", ""):
-                    all_users.add(u_upper)
-    return sorted(all_users)
-
-
 def refresh_users(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("refresh-users: starting rich user metrics rebuild")
+    logging.info("refresh-users: starting rich user metrics rebuild (single-pass)")
 
-    index_df = _read_parquet(INDEX_BLOB_PATH)
-    if index_df.empty:
+    full_df = _read_all_transformed_df(columns=NEEDED_COLS)
+    if full_df.empty:
         return func.HttpResponse(
-            json.dumps({"status": "skipped", "message": "Index is empty. Run /build-index first."}),
+            json.dumps({"status": "skipped", "message": "No transformed parquet data found. Run /transform-daily first."}),
             status_code=200, mimetype="application/json"
         )
 
-    # Parse users list from index
-    index_df["users"] = index_df["users"].apply(_safe_json_loads)
-    index_df["DECLARATIONID"] = index_df["DECLARATIONID"].astype(str)
+    # Reduce to exactly the same universe the index (and therefore the previous
+    # path) used: standardise text columns, require a valid datetime/declaration,
+    # and drop DKM_VP. This guarantees the discovered user set and per-user
+    # declaration sets match the old index-driven behaviour.
+    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
+        if col in full_df.columns:
+            full_df[col] = full_df[col].astype(str).str.strip().str.upper()
+    full_df["HISTORYDATETIME"] = pd.to_datetime(full_df["HISTORYDATETIME"], errors="coerce", format="mixed")
+    full_df = full_df.dropna(subset=["HISTORYDATETIME", "DECLARATIONID"])
+    if "ACTIVECOMPANY" in full_df.columns:
+        full_df = full_df[full_df["ACTIVECOMPANY"] != "DKM_VP"]
+    full_df["DECLARATIONID"] = full_df["DECLARATIONID"].astype(str)
 
-    # Auto-discover all human users from the index
-    all_users = _discover_all_users(index_df)
-    logging.info(f"refresh-users: discovered {len(all_users)} human users from the index")
+    if full_df.empty:
+        return func.HttpResponse(
+            json.dumps({"status": "skipped", "message": "No usable rows after cleaning."}),
+            status_code=200, mimetype="application/json"
+        )
+
+    # user -> array(DECLARATIONID) in one vectorized pass (replaces the per-user
+    # index .apply scan that was O(users x declarations)).
+    user_to_decls = full_df.groupby("USERCODE")["DECLARATIONID"].unique()
+    all_users = sorted(
+        u for u in user_to_decls.index
+        if u not in SYSTEM_USERS and u not in ("NAN", "NONE", "")
+    )
+    logging.info(f"refresh-users: discovered {len(all_users)} human users from {len(full_df)} rows")
 
     processed_count = 0
     failed_count = 0
 
     for user in all_users:
-        username_upper = user.upper()
         try:
-            # Step A: find this user's declarations and date range from the index
-            user_index_rows = index_df[index_df["users"].apply(
-                lambda us: username_upper in [u.upper() for u in (us if isinstance(us, list) else [])]
-            )]
-
-            if user_index_rows.empty:
-                logging.info(f"refresh-users: no data found for {user}")
-                _write_json_blob(
-                    {"user": user, "daily_metrics": [], "summary": {}},
-                    f"{USER_CACHE_PATH_PREFIX}{user}.json"
-                )
-                continue
-
-            decl_ids = set(user_index_rows["DECLARATIONID"].tolist())
-            first_date = datetime.strptime(user_index_rows["first_seen"].min(), "%Y-%m-%d").date()
-            last_date = datetime.strptime(user_index_rows["last_seen"].max(), "%Y-%m-%d").date()
-
-            logging.info(f"refresh-users: {user} → {len(decl_ids)} declarations, {first_date} → {last_date}")
-
-            # Step B: load daily parquets for date range, filter immediately per parquet
-            filtered_frames = []
-            curr = first_date
-            while curr <= last_date:
-                path = _daily_parquet_path(curr)
-                df_day = _read_parquet(path)
-                if not df_day.empty:
-                    df_day["DECLARATIONID"] = df_day["DECLARATIONID"].astype(str)
-                    filtered = df_day[df_day["DECLARATIONID"].isin(decl_ids)]
-                    if not filtered.empty:
-                        filtered_frames.append(filtered)
-                    del df_day  # free memory immediately
-                curr += timedelta(days=1)
-
-            if not filtered_frames:
-                logging.warning(f"refresh-users: {user} — no parquet data found in date range")
-                _write_json_blob(
-                    {"user": user, "daily_metrics": [], "summary": {}},
-                    f"{USER_CACHE_PATH_PREFIX}{user}.json"
-                )
-                continue
-
-            # Step C: combine the small filtered frames and compute rich metrics
-            user_df = pd.concat(filtered_frames, ignore_index=True)
-            del filtered_frames  # free memory
+            decl_ids = set(user_to_decls.loc[user])
+            # Slice the in-memory frame (no blob re-reads). _compute_rich_user_metrics
+            # copies and re-cleans internally, so this is the exact same input the
+            # old path built from per-day parquet reads.
+            user_df = full_df[full_df["DECLARATIONID"].isin(decl_ids)]
 
             metrics = _compute_rich_user_metrics(user_df, user)
-            del user_df  # free memory
 
             _write_json_blob(metrics, f"{USER_CACHE_PATH_PREFIX}{user}.json")
             processed_count += 1
@@ -923,147 +933,6 @@ def _compute_rich_user_metrics(df: pd.DataFrame, username: str) -> dict:
     }
 
 
-# Keep the index-based version for the hot path (fast, less detail)
-def _calculate_user_metrics_from_index(index_df: pd.DataFrame, username: str) -> dict:
-    """
-    Lightweight version using only the pre-built index.
-    Used by refresh-hot for fast incremental updates.
-    For full rich metrics, see _compute_rich_user_metrics().
-    """
-    username_upper = username.upper()
-    user_rows = index_df[index_df["users"].apply(
-        lambda us: username_upper in [u.upper() for u in (us if isinstance(us, list) else [])]
-    )]
-    if user_rows.empty:
-        return {"user": username, "summary": {}, "monthly_breakdown": []}
-
-    system_users = {"BATCHPROC", "ADMIN", "SYSTEM", "BATCH_PROC"}
-    is_creator = user_rows["created_by"] == username_upper
-    is_modifier = user_rows["modified_by"] == username_upper
-    sys_created = user_rows["created_by"].isin(system_users)
-    
-    gets_credit = (is_creator & ~sys_created) | (sys_created & is_modifier)
-    credited_rows = user_rows[gets_credit].copy()
-
-    is_auto_file = credited_rows["has_interface"] | credited_rows["created_by"].isin(system_users)
-    is_manual_file = credited_rows["has_manual_trigger"] & ~is_auto_file
-
-    total_manual = int(is_manual_file.sum())
-    total_auto = int(is_auto_file.sum())
-    total_files = total_manual + total_auto
-    durations = credited_rows["file_creation_duration"].dropna().tolist()
-    avg_duration = round(sum(durations) / len(durations), 2) if durations else None
-    
-    total_mods = int(user_rows["modification_count"].sum())
-
-    credited_rows["month"] = pd.to_datetime(
-        credited_rows["first_seen"], errors="coerce"
-    ).dt.to_period("M").astype(str)
-    monthly = []
-    for month_str, grp in credited_rows.groupby("month"):
-        grp_auto = grp["has_interface"] | grp["created_by"].isin(system_users)
-        grp_manual = grp["has_manual_trigger"] & ~grp_auto
-        manual_files = int(grp_manual.sum())
-        automatic_files = int(grp_auto.sum())
-        monthly.append({
-            "month": month_str,
-            "total_files": manual_files + automatic_files,
-            "manual_files": manual_files,
-            "automatic_files": automatic_files,
-            "total_modifications": int(grp["modification_count"].sum()),
-        })
-
-    return {
-        "user": username,
-        "summary": {
-            "total_manual_files": total_manual,
-            "total_automatic_files": total_auto,
-            "total_files_handled": total_files,
-            "total_modifications": total_mods,
-            "avg_file_creation_duration_hours": avg_duration,
-        },
-        "monthly_breakdown": sorted(monthly, key=lambda x: x["month"])
-    }
-
-
-# ===========================================================================
-# ROUTE 4 – POST /refresh-monthly
-# Reads the index → writes monthly report cache (all discovered users in ~30 days).
-# ===========================================================================
-
-def refresh_monthly(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("refresh-monthly: loading file index")
-
-    index_df = _read_parquet(INDEX_BLOB_PATH)
-    if index_df.empty:
-        return func.HttpResponse(
-            json.dumps({"status": "skipped", "message": "Index is empty. Run /build-index first."}),
-            status_code=200, mimetype="application/json"
-        )
-
-    index_df["users"] = index_df["users"].apply(_safe_json_loads)
-
-    cutoff = (datetime.utcnow() - timedelta(days=30)).date().isoformat()
-    recent = index_df[index_df["first_seen"] >= cutoff]
-
-    all_users = _discover_all_users(index_df)
-    logging.info(f"refresh-monthly: discovered {len(all_users)} users")
-
-    results = []
-    for username in all_users:
-        username_upper = username.upper()
-
-        user_rows = recent[recent["users"].apply(
-            lambda us: username_upper in [u.upper() for u in (us if isinstance(us, list) else [])]
-        )]
-
-        if user_rows.empty:
-            continue
-
-        system_users = {"BATCHPROC", "ADMIN", "SYSTEM", "BATCH_PROC"}
-        is_creator = user_rows["created_by"] == username_upper
-        is_modifier = user_rows["modified_by"] == username_upper
-        sys_created = user_rows["created_by"].isin(system_users)
-        
-        gets_credit = (is_creator & ~sys_created) | (sys_created & is_modifier)
-        credited_rows = user_rows[gets_credit]
-
-        is_auto_file = credited_rows["has_interface"] | credited_rows["created_by"].isin(system_users)
-        is_manual_file = credited_rows["has_manual_trigger"] & ~is_auto_file
-
-        total_manual = int(is_manual_file.sum())
-        total_auto = int(is_auto_file.sum())
-        total_creations = total_manual + total_auto
-        total_sent = int(credited_rows["sending_count"].sum())
-
-        # Working days with activity (unique weekdays)
-        dates = pd.to_datetime(credited_rows["first_seen"], errors="coerce").dt.date
-        working_days_active = len(set(d for d in dates if pd.notna(d) and d.weekday() < 5))
-
-        avg_per_day = round(total_creations / working_days_active, 2) if working_days_active > 0 else 0
-
-        results.append({
-            "user": username,
-            "total_files_handled": total_creations,
-            "manual_files": total_manual,
-            "automatic_files": total_auto,
-            "sent_files": total_sent,
-            "days_with_activity": working_days_active,
-            "avg_activity_per_day": avg_per_day,
-            "manual_vs_auto_ratio": {
-                "manual_percent": round((total_manual / total_creations) * 100, 2) if total_creations else 0,
-                "automatic_percent": round((total_auto / total_creations) * 100, 2) if total_creations else 0,
-            }
-        })
-
-    _write_json_blob(results, MONTHLY_SUMMARY_BLOB_PATH)
-
-    return func.HttpResponse(
-        json.dumps({"status": "success", "users_in_report": len(results)}),
-        status_code=200, mimetype="application/json"
-    )
-
-
 # ===========================================================================
 # ROUTE 5 – POST /refresh
 # Reads last 10 working days parquet files → writes 10-day summary cache.
@@ -1105,28 +974,37 @@ def refresh_10day(req: func.HttpRequest) -> func.HttpResponse:
     # Auto-discover all unique users from the raw data
     all_user_codes = set(df["USERCODE"].dropna().unique())
 
+    # Dedupe once globally, then pre-group by declaration so we never re-filter or
+    # re-group the frame per user. The per-user crediting logic below is byte-
+    # identical to before — we've only hoisted the shared groupby/dedup out of the
+    # user loop (the part that made this O(users) and slow).
+    df = df.drop_duplicates(
+        subset=["DECLARATIONID", "USERCODE", "HISTORY_STATUS", "HISTORYDATETIME"]
+    )
+    decl_groups = {
+        decl_id: g.sort_values("HISTORYDATETIME")
+        for decl_id, g in df.groupby("DECLARATIONID")
+    }
+    user_to_decls = df.groupby("USERCODE")["DECLARATIONID"].unique()
+    working_days_set = set(working_days)
+
     results = []
     for user in sorted(all_user_codes):
         user_daily = {day.strftime("%d/%m"): 0 for day in working_days}
 
-        user_decls = df[df["USERCODE"] == user]["DECLARATIONID"].unique()
+        user_decls = user_to_decls.get(user, [])
         if len(user_decls) == 0:
             results.append({"user": user, "daily_file_creations": user_daily})
             continue
 
-        user_scope_df = df[df["DECLARATIONID"].isin(user_decls)].copy()
-        user_scope_df = user_scope_df.drop_duplicates(
-            subset=["DECLARATIONID", "USERCODE", "HISTORY_STATUS", "HISTORYDATETIME"]
-        )
-
-        for decl_id, group in user_scope_df.groupby("DECLARATIONID"):
-            group = group.sort_values("HISTORYDATETIME")
+        for decl_id in user_decls:
+            group = decl_groups[decl_id]
             user_rows = group[group["USERCODE"] == user]
             if user_rows.empty:
                 continue
 
             first_action_date = user_rows["HISTORYDATETIME"].min().date()
-            if first_action_date not in working_days:
+            if first_action_date not in working_days_set:
                 continue
 
             is_manual, is_automatic = classify_file_activity(
@@ -1195,448 +1073,6 @@ def file_lifecycle(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(
         json.dumps({"found": False, "declaration_id": declaration_id, "message": "Declaration not found in index."}),
         status_code=404, mimetype="application/json"
-    )
-
-
-# ===========================================================================
-# ROUTE 7 – POST /refresh-hot
-# ═══════════════════════════════════════════════════════════════════════════
-# This is the LIVE pipeline. Call it from your Logic App immediately after
-# saving the JSON blob. It processes only the NEW 2-hour data slice and
-# does an incremental update of the index + caches.
-#
-# How to call it from Logic App:
-#   Add an HTTP action AFTER "Create_blob_(V2)" step:
-#     POST https://<your-function-app>.azurewebsites.net/api/performanceV3/refresh-hot
-#     Headers: x-functions-key: <your-key>
-#     Body: { "blob_name": "<full path of the blob just created>" }
-#
-# Alternatively (auto-detect mode, no body needed):
-#   It will find all landing JSON blobs written in the last 3 hours that
-#   have NOT yet been merged into today's parquet.
-# ===========================================================================
-
-# Tracks which landing blobs have been processed (stored in blob storage)
-HOT_STATE_BLOB = f"{BLOB_BASE}/state/hot_processed.json"
-
-
-def _load_hot_state() -> set:
-    """Load the set of already-processed landing blob names."""
-    raw = _read_json_blob(HOT_STATE_BLOB)
-    if raw and isinstance(raw, list):
-        return set(raw)
-    return set()
-
-
-def _save_hot_state(processed: set):
-    """Persist the set of processed blob names (keep last 500 to avoid unbounded growth)."""
-    ordered = sorted(processed)[-500:]  # keep only the most recent 500
-    _write_json_blob(ordered, HOT_STATE_BLOB)
-
-
-def _build_index_rows_for_df(df: pd.DataFrame) -> list:
-    """
-    Given a DataFrame of raw history rows, return a list of index-row dicts
-    (one per DECLARATIONID).  Same logic as build_index() but works on a
-    small subset of data so it runs in milliseconds.
-    """
-    system_users = {"BATCHPROC", "ADMIN", "SYSTEM", "BATCH_PROC"}
-    rows = []
-
-    for decl_id, group in df.groupby("DECLARATIONID"):
-        group = group.sort_values("HISTORYDATETIME")
-        statuses = group["HISTORY_STATUS"].tolist()
-        has_interface = "INTERFACE" in set(statuses)
-        has_manual_trigger = bool({"COPIED", "COPY", "NEW"}.intersection(set(statuses)))
-        first_seen = group["HISTORYDATETIME"].min().date().isoformat()
-        last_seen = group["HISTORYDATETIME"].max().date().isoformat()
-
-        company = str(group["ACTIVECOMPANY"].iloc[0]) if "ACTIVECOMPANY" in group.columns else ""
-        principal = str(group[PRINCIPAL_FIELD].iloc[0]) if PRINCIPAL_FIELD in group.columns else ""
-        type_val = str(group["TYPEDECLARATIONSSW"].iloc[0]) if "TYPEDECLARATIONSSW" in group.columns else ""
-
-        unique_users = list(group["USERCODE"].unique())
-        human_users = [u for u in unique_users if u not in system_users]
-        created_by = str(group.iloc[0]["USERCODE"])
-
-        human_actions = group[~group["USERCODE"].isin(system_users)]
-        mod_rows = human_actions[human_actions["HISTORY_STATUS"] == "MODIFIED"]
-        if not mod_rows.empty:
-            modified_by = str(mod_rows["USERCODE"].value_counts().idxmax())
-        elif not human_actions.empty:
-            modified_by = str(human_actions.iloc[0]["USERCODE"])
-        else:
-            modified_by = created_by
-
-        session_start = None
-        file_creation_duration = None
-        for _, row in group.iterrows():
-            if row["HISTORY_STATUS"] == "MODIFIED" and session_start is None:
-                session_start = row["HISTORYDATETIME"]
-            elif row["HISTORY_STATUS"] == "WRT_ENT" and session_start is not None:
-                file_creation_duration = round((row["HISTORYDATETIME"] - session_start).total_seconds() / 3600, 3)
-                break
-
-        rows.append({
-            "DECLARATIONID": decl_id,
-            "first_seen": first_seen,
-            "last_seen": last_seen,
-            "principal": principal,
-            "company": company,
-            "users": json.dumps(unique_users),
-            "human_users": json.dumps(human_users),
-            "has_interface": has_interface,
-            "has_manual_trigger": has_manual_trigger,
-            "created_by": created_by,
-            "modified_by": modified_by,
-            "file_creation_duration": file_creation_duration,
-            "statuses": json.dumps(list(set(statuses))),
-            "sending_count": int((group["HISTORY_STATUS"] == "DEC_DAT").sum()),
-            "modification_count": int((group["HISTORY_STATUS"] == "MODIFIED").sum()),
-            "type": type_val,
-        })
-    return rows
-
-
-def refresh_hot(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Near-live pipeline. Called by Logic App every 2 hours after a new JSON
-    blob is uploaded to the landing zone.
-
-    Steps:
-      1. Identify which landing blobs are NEW (not yet processed)
-      2. Parse the new JSON blob(s) → small DataFrame
-      3. Merge into today's daily parquet (upsert on DECLARATIONID)
-      4. Patch the file index — only rows for declarations in new data
-      5. Rebuild 10-day summary cache
-      6. Rebuild user caches — only users appearing in new data
-      7. Save updated hot-state so we never re-process the same blob
-    """
-    logging.info("=== refresh-hot started ===")
-    now_utc = datetime.utcnow()
-    today = now_utc.date()
-
-    # force=true skips the already-processed check (useful for testing)
-    force = req.params.get("force", "false").lower() == "true"
-
-    # ------------------------------------------------------------------
-    # STEP 1 – identify which blob(s) to process
-    # ------------------------------------------------------------------
-    # Prefer explicit blob_name from request body (sent by Logic App)
-    new_blob_names = []
-    try:
-        body = req.get_json()
-        explicit_blob = body.get("blob_name") if body else None
-    except Exception:
-        explicit_blob = None
-
-    processed_set = _load_hot_state()
-
-    if explicit_blob:
-        # Logic App told us exactly which blob was just created
-        if explicit_blob in processed_set and not force:
-            return func.HttpResponse(
-                json.dumps({"status": "skipped", "reason": f"Blob '{explicit_blob}' already processed. Add ?force=true to reprocess."}),
-                status_code=200, mimetype="application/json"
-            )
-        new_blob_names = [explicit_blob]
-    else:
-        # Auto-detect: scan landing blobs from today and yesterday, find unprocessed
-        for scan_date in [today, today - timedelta(days=1)]:
-            prefix = f"{LANDING_PREFIX}day={scan_date.isoformat()}/"
-            all_today_blobs = _list_blobs(prefix)
-            new_blob_names += [b for b in all_today_blobs if b not in processed_set]
-
-    if not new_blob_names:
-        return func.HttpResponse(
-            json.dumps({"status": "no_new_data", "message": "No new landing blobs to process."}),
-            status_code=200, mimetype="application/json"
-        )
-
-    logging.info(f"refresh-hot: processing {len(new_blob_names)} new blob(s): {new_blob_names}")
-
-    # ------------------------------------------------------------------
-    # STEP 2 – parse the new blobs → DataFrame
-    # ------------------------------------------------------------------
-    frames = []
-    for blob_name in new_blob_names:
-        try:
-            raw = _blob_client(blob_name).download_blob().readall()
-            records = json.loads(raw)
-            if isinstance(records, list) and records:
-                frames.append(pd.DataFrame(records))
-        except Exception as e:
-            logging.error(f"refresh-hot: failed to read blob '{blob_name}': {e}")
-
-    if not frames:
-        return func.HttpResponse(
-            json.dumps({"status": "no_data", "message": "New blobs were empty or unreadable."}),
-            status_code=200, mimetype="application/json"
-        )
-
-    new_df = pd.concat(frames, ignore_index=True)
-
-    # Standardise
-    for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
-        if col in new_df.columns:
-            new_df[col] = new_df[col].astype(str).str.strip().str.upper()
-    new_df["HISTORYDATETIME"] = pd.to_datetime(new_df["HISTORYDATETIME"], errors="coerce", format="mixed")
-    new_df = new_df.dropna(subset=["HISTORYDATETIME", "DECLARATIONID"])
-    if "ACTIVECOMPANY" in new_df.columns:
-        new_df = new_df[new_df["ACTIVECOMPANY"] != "DKM_VP"]
-
-    new_decl_ids = set(new_df["DECLARATIONID"].unique())
-    affected_users = set(new_df["USERCODE"].dropna().unique()) - SYSTEM_USERS
-
-    logging.info(f"refresh-hot: {len(new_df)} rows, {len(new_decl_ids)} declarations, "
-                 f"{len(affected_users)} users affected")
-
-    # ------------------------------------------------------------------
-    # STEP 3 – merge into today's daily parquet (upsert)
-    # ------------------------------------------------------------------
-    today_parquet_path = _daily_parquet_path(today)
-    existing_today = _read_parquet(today_parquet_path)
-
-    if existing_today.empty:
-        merged_today = new_df
-    else:
-        # Remove old rows for declarations that appear in the new data
-        # (they may have new status rows we want to add)
-        existing_other = existing_today[
-            ~existing_today["DECLARATIONID"].isin(new_decl_ids)
-        ]
-        # Also keep old rows from the SAME declarations so we have the full history
-        existing_same = existing_today[
-            existing_today["DECLARATIONID"].isin(new_decl_ids)
-        ]
-        merged_today = pd.concat([existing_same, new_df, existing_other], ignore_index=True)
-
-    # Deduplicate
-    dup_cols = [c for c in ["DECLARATIONID", "USERCODE", "HISTORY_STATUS", "HISTORYDATETIME"] if c in merged_today.columns]
-    merged_today = merged_today.drop_duplicates(subset=dup_cols)
-    _write_parquet(merged_today, today_parquet_path)
-    logging.info(f"refresh-hot: today's parquet updated → {len(merged_today)} rows")
-
-    # ------------------------------------------------------------------
-    # STEP 4 – patch the file index (incremental update)
-    # ------------------------------------------------------------------
-    index_df = _read_parquet(INDEX_BLOB_PATH)
-
-    # Build a full picture for the affected declarations:
-    # combine new data with their existing history in today's parquet
-    affected_full_df = merged_today[merged_today["DECLARATIONID"].isin(new_decl_ids)].copy()
-
-    # Also pull their history from past day parquets if they existed before today
-    # We only do this if they're NOT brand-new declarations
-    if not index_df.empty:
-        index_df["DECLARATIONID"] = index_df["DECLARATIONID"].astype(str)
-        new_decl_ids_str = {str(d) for d in new_decl_ids}
-        existing_in_index = set(index_df["DECLARATIONID"].tolist())
-        old_decls = new_decl_ids_str.intersection(existing_in_index)
-
-        if old_decls:
-            # Load their earliest history from parquet archive
-            old_index_rows = index_df[index_df["DECLARATIONID"].isin(old_decls)]
-            min_date_str = old_index_rows["first_seen"].min()
-            try:
-                scan_start = datetime.strptime(min_date_str, "%Y-%m-%d").date()
-            except Exception:
-                scan_start = today
-
-            extra_frames = []
-            curr = scan_start
-            while curr < today:  # today is already in merged_today
-                path = _daily_parquet_path(curr)
-                df_d = _read_parquet(path)
-                if not df_d.empty:
-                    relevant = df_d[df_d["DECLARATIONID"].isin(old_decls)]
-                    if not relevant.empty:
-                        extra_frames.append(relevant)
-                curr += timedelta(days=1)
-
-            if extra_frames:
-                historical = pd.concat(extra_frames, ignore_index=True)
-                affected_full_df = pd.concat([historical, affected_full_df], ignore_index=True)
-                affected_full_df = affected_full_df.drop_duplicates(
-                    subset=[c for c in dup_cols if c in affected_full_df.columns]
-                )
-
-    # Compute updated index rows for affected declarations
-    new_index_rows = _build_index_rows_for_df(affected_full_df)
-
-    if not index_df.empty:
-        # Remove old index entries for affected declarations
-        index_df["DECLARATIONID"] = index_df["DECLARATIONID"].astype(str)
-        affected_ids_str = {str(d) for d in new_decl_ids}
-        index_df = index_df[~index_df["DECLARATIONID"].isin(affected_ids_str)]
-
-    patch_df = pd.DataFrame(new_index_rows)
-    updated_index_df = pd.concat([index_df, patch_df], ignore_index=True)
-    _write_parquet(updated_index_df, INDEX_BLOB_PATH)
-    logging.info(f"refresh-hot: index patched → {len(updated_index_df)} total declarations")
-
-    # ------------------------------------------------------------------
-    # STEP 5 – rebuild 10-day summary cache
-    # ------------------------------------------------------------------
-    working_days = _last_n_working_days(10)
-    day_frames = []
-    for day in working_days:
-        path = _daily_parquet_path(day)
-        df_day = _read_parquet(path)
-        if not df_day.empty:
-            day_frames.append(df_day)
-
-    if day_frames:
-        df_10 = pd.concat(day_frames, ignore_index=True)
-        for col in ["USERCODE", "HISTORY_STATUS", "ACTIVECOMPANY", "TYPEDECLARATIONSSW", PRINCIPAL_FIELD]:
-            if col in df_10.columns:
-                df_10[col] = df_10[col].astype(str).str.strip().str.upper()
-        df_10["HISTORYDATETIME"] = pd.to_datetime(df_10["HISTORYDATETIME"], errors="coerce", format="mixed")
-        df_10 = df_10.dropna(subset=["HISTORYDATETIME"])
-        df_10["HISTORYDATETIME"] = df_10["HISTORYDATETIME"].dt.tz_localize(None)
-        if "ACTIVECOMPANY" in df_10.columns:
-            df_10 = df_10[df_10["ACTIVECOMPANY"] != "DKM_VP"]
-
-        results_10 = []
-        # Auto-discover users from the 10-day data
-        all_10d_users = sorted(set(df_10["USERCODE"].dropna().unique()))
-
-        for user in all_10d_users:
-            user_daily = {day.strftime("%d/%m"): 0 for day in working_days}
-            
-            user_decls = df_10[df_10["USERCODE"] == user]["DECLARATIONID"].unique()
-            if len(user_decls) == 0:
-                results_10.append({"user": user, "daily_file_creations": user_daily})
-                continue
-
-            scope2 = df_10[df_10["DECLARATIONID"].isin(user_decls)].copy()
-            scope2 = scope2.drop_duplicates(
-                subset=[c for c in ["DECLARATIONID", "USERCODE", "HISTORY_STATUS", "HISTORYDATETIME"] if c in scope2.columns]
-            )
-            for decl_id, group in scope2.groupby("DECLARATIONID"):
-                group = group.sort_values("HISTORYDATETIME")
-                user_rows = group[group["USERCODE"] == user]
-                if user_rows.empty:
-                    continue
-                first_action_date = user_rows["HISTORYDATETIME"].min().date()
-                if first_action_date not in working_days:
-                    continue
-                is_manual, is_automatic = classify_file_activity(
-                    global_history=group["HISTORY_STATUS"].tolist(),
-                    user_history=user_rows["HISTORY_STATUS"].tolist(),
-                    group_df=group,
-                    target_user=user
-                )
-                if is_manual or is_automatic:
-                    user_daily[first_action_date.strftime("%d/%m")] += 1
-
-            results_10.append({"user": user, "daily_file_creations": user_daily})
-
-        _write_json_blob(results_10, SUMMARY_BLOB_PATH)
-        logging.info("refresh-hot: 10-day summary cache updated")
-
-    # ------------------------------------------------------------------
-    # STEP 6 – refresh user caches for affected users only
-    # ------------------------------------------------------------------
-    updated_index_df["users"] = updated_index_df["users"].apply(_safe_json_loads)
-    updated_index_df["statuses"] = updated_index_df["statuses"].apply(_safe_json_loads)
-
-    user_cache_count = 0
-    for user in affected_users:
-        try:
-            metrics = _calculate_user_metrics_from_index(updated_index_df, user)
-            _write_json_blob(metrics, f"{USER_CACHE_PATH_PREFIX}{user}.json")
-            user_cache_count += 1
-        except Exception as e:
-            logging.error(f"refresh-hot: failed to update cache for {user}: {e}")
-
-    logging.info(f"refresh-hot: updated {user_cache_count} user caches")
-
-    # ------------------------------------------------------------------
-    # STEP 7 – mark blobs as processed
-    # ------------------------------------------------------------------
-    processed_set.update(new_blob_names)
-    _save_hot_state(processed_set)
-
-    return func.HttpResponse(
-        json.dumps({
-            "status": "success",
-            "blobs_processed": new_blob_names,
-            "new_rows": len(new_df),
-            "declarations_updated": len(new_decl_ids),
-            "user_caches_refreshed": user_cache_count,
-            "affected_users": list(affected_users),
-            "last_updated_utc": now_utc.isoformat()
-        }),
-        status_code=200, mimetype="application/json"
-    )
-
-
-# ===========================================================================
-# ROUTE 8 – DELETE /reset-hot-state
-# Clear the hot_processed.json so that already-processed blobs can be
-# re-processed by refresh-hot. Use this during testing.
-# ===========================================================================
-
-def reset_hot_state() -> func.HttpResponse:
-    """Wipe the hot-state file so refresh-hot treats all blobs as new."""
-    bc = _blob_client(HOT_STATE_BLOB)
-    existed = bc.exists()
-    if existed:
-        bc.delete_blob()
-    _write_json_blob([], HOT_STATE_BLOB)   # write empty list back
-    return func.HttpResponse(
-        json.dumps({
-            "status": "ok",
-            "message": "Hot-state cleared. All landing blobs will be re-processed on next refresh-hot call.",
-            "file_deleted": existed
-        }),
-        status_code=200, mimetype="application/json"
-    )
-
-
-# ===========================================================================
-# ROUTE 9 – DELETE /reset-all
-# Nuclear reset for testing: wipes hot-state + all generated caches.
-# Does NOT delete source landing JSON files or daily parquets.
-# ===========================================================================
-
-def reset_all() -> func.HttpResponse:
-    """Wipe all caches and the hot-state. Use for a clean test run."""
-    deleted = []
-    skipped = []
-
-    paths_to_delete = [
-        HOT_STATE_BLOB,           # processed-blob tracker
-        INDEX_BLOB_PATH,          # file index
-        SUMMARY_BLOB_PATH,        # 10-day summary cache
-        MONTHLY_SUMMARY_BLOB_PATH,  # monthly report cache
-    ]
-
-    # Also delete all per-user cache files
-    user_cache_blobs = _list_blobs(USER_CACHE_PATH_PREFIX)
-    paths_to_delete += user_cache_blobs
-
-    for path in paths_to_delete:
-        try:
-            bc = _blob_client(path)
-            if bc.exists():
-                bc.delete_blob()
-                deleted.append(path)
-            else:
-                skipped.append(path)
-        except Exception as e:
-            logging.warning(f"reset-all: could not delete '{path}': {e}")
-            skipped.append(path)
-
-    return func.HttpResponse(
-        json.dumps({
-            "status": "ok",
-            "message": "All caches and state cleared. Run refresh-hot or refresh to rebuild.",
-            "deleted": deleted,
-            "not_found": skipped
-        }),
-        status_code=200, mimetype="application/json"
     )
 
 
@@ -1713,7 +1149,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         method = req.method
         action = req.route_params.get("action")
         user_param = req.params.get("user")
-        all_users_param = req.params.get("all_users", "false").lower() == "true"
 
         # ---------------------------------------------------------------
         # POST routes (heavy computation / transformation)
@@ -1732,29 +1167,12 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             return build_index(req)
 
         elif method == "POST" and action == "refresh-users":
-            # Build per-user JSON caches from the index (fast)
+            # Build per-user JSON caches in a single pass over all daily parquets
             return refresh_users(req)
-
-        elif method == "POST" and action == "refresh-monthly":
-            # Build monthly report cache from the index (fast)
-            return refresh_monthly(req)
-
-        elif method == "POST" and action == "refresh-hot":
-            # ⚡ LIVE pipeline — call this from Logic App every 2 hours
-            # Use ?force=true to reprocess an already-seen blob (testing)
-            return refresh_hot(req)
 
         elif method == "POST" and action == "refresh":
             # Full rebuild of 10-day summary cache (daily cold run)
             return refresh_10day(req)
-
-        elif method == "DELETE" and action == "reset-hot-state":
-            # 🧪 Testing: clear the processed-blob tracker
-            return reset_hot_state()
-
-        elif method == "DELETE" and action == "reset-all":
-            # 🧪 Testing: wipe all caches + state (does NOT delete source data)
-            return reset_all()
 
         # ---------------------------------------------------------------
         # GET routes (instant reads from cache / index)
@@ -1809,17 +1227,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             if not bc.exists():
                 return func.HttpResponse(
                     json.dumps({"error": f"Cache for user '{user_param}' not found. Trigger POST /refresh-users first."}),
-                    status_code=404, mimetype="application/json"
-                )
-            return func.HttpResponse(bc.download_blob().readall(), status_code=200, mimetype="application/json")
-
-        elif method == "GET" and all_users_param:
-            # Instant: read monthly report cache
-            logging.info(f"Reading monthly cache: {MONTHLY_SUMMARY_BLOB_PATH}")
-            bc = _blob_client(MONTHLY_SUMMARY_BLOB_PATH)
-            if not bc.exists():
-                return func.HttpResponse(
-                    json.dumps({"error": "Monthly report cache not found. Trigger POST /refresh-monthly first."}),
                     status_code=404, mimetype="application/json"
                 )
             return func.HttpResponse(bc.download_blob().readall(), status_code=200, mimetype="application/json")

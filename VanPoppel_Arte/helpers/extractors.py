@@ -3,6 +3,33 @@ import re
 import logging
 
 from AI_agents.OpenAI.custom_call import CustomCall
+from global_db.functions.numbers.number_format import parse_number
+from VanPoppel_Arte.helpers.validation import INCOTERMS
+
+_CURRENCIES = {
+    'USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'CHF', 'CNY', 'SEK', 'NOK',
+    'DKK', 'PLN', 'CZK', 'HUF', 'RUB', 'BRL', 'MXN', 'INR', 'KRW', 'SGD',
+    'HKD', 'NZD', 'ZAR', 'TRY', 'ILS', 'AED', 'SAR', 'THB', 'MYR', 'IDR',
+    'PHP', 'VND', 'EGP', 'MAD', 'TND', 'DZD'
+}
+
+
+def collect_numeric_strings(raw_items, footer_text=""):
+    """Gather the raw numeric strings of a document for number-format detection."""
+    strings = []
+    for item in raw_items or []:
+        for key in ("net_weight", "surface", "quantity", "unit_price", "amount"):
+            value = item.get(key)
+            if value:
+                m = re.search(r"[\d.,]+", str(value))
+                if m:
+                    strings.append(m.group(0))
+    for pattern in (r"(?:Total incl\.?VAT|Montant TTC|Total inkl. MwSt.):\s+([\d,.]+)",
+                    r"Transport\s+([\d,.]+)"):
+        m = re.search(pattern, footer_text or "")
+        if m:
+            strings.append(m.group(1))
+    return strings
 
 """def extract_products_from_text(text):
     lines = text.strip().splitlines()
@@ -158,27 +185,68 @@ def extract_invoice_meta_and_shipping(text):
     meta["shipping_address"] = shipping_address.strip()
     return meta
 
-def extract_totals_and_incoterm(text):
+def extract_totals_and_incoterm(text, fmt="US"):
+    """Extract incoterm and totals. Pass the FULL document text — Arte spreads
+    the footer over several pages (Incoterms on one page, totals on another)."""
     data = {}
-    lines = text.splitlines()
+    lines = [line.strip() for line in text.splitlines()]
 
-    incoterm = ""
+    # The incoterm value can sit before, on, or after the 'Incoterms:' label
+    # depending on the PDF's text-layer ordering. Collect the candidates and
+    # keep the first one whose first word is a real Incoterm term.
+    term = ""
     location = ""
-
     for i, line in enumerate(lines):
-        if "Incoterms:" in line and i > 0:
-            incoterm = lines[i - 1].strip()
-        if "Location 1:" in line and i > 0:
-            location = lines[i - 1].strip()
+        if "Incoterms:" in line:
+            candidates = [line.split("Incoterms:", 1)[1]]
+            if i > 0:
+                candidates.append(lines[i - 1])
+            if i + 1 < len(lines):
+                candidates.append(lines[i + 1])
+            for candidate in candidates:
+                candidate = (candidate or "").strip()
+                if candidate and candidate.split(" ", 1)[0].upper() in INCOTERMS:
+                    term = candidate
+                    break
+            if term:
+                break
+    for i, line in enumerate(lines):
+        if "Location 1:" in line:
+            candidates = [line.split("Location 1:", 1)[1]]
+            if i > 0:
+                candidates.append(lines[i - 1])
+            for candidate in candidates:
+                candidate = (candidate or "").strip()
+                if candidate and not candidate.endswith(":") \
+                        and candidate.split(" ", 1)[0].upper() not in INCOTERMS:
+                    location = candidate
+                    break
+            if location:
+                break
 
-    if incoterm and location:
-        data["incoterm"] = f"{incoterm} {location}"
+    if term:
+        # location is optional — the term alone is still a valid incoterm
+        data["incoterm"] = f"{term} {location}".strip() if location not in term else term
+
+    # US commercial invoices carry a second incoterm for customs ("This
+    # commercial invoice is for customs purposes only" followed by e.g.
+    # "FCA" / "ZONHOVEN") — that export-leg term is the one the declaration
+    # needs, so it overrides the commercial one.
+    customs_idx = next((i for i, line in enumerate(lines) if "customs purposes" in line.lower()), None)
+    if customs_idx is not None:
+        for j in range(customs_idx + 1, min(customs_idx + 4, len(lines))):
+            if lines[j].upper() in INCOTERMS:
+                place = ""
+                if j + 1 < len(lines) and lines[j + 1] and not lines[j + 1].endswith(":"):
+                    place = lines[j + 1]
+                data["incoterm"] = f"{lines[j]} {place}".strip()
+                break
 
     # Updated regex to handle both "Total incl VAT:" and "Montant TTC:"
     total_match = re.search(r"(?:Total incl\.?VAT|Montant TTC|Total inkl. MwSt.):\s+([\d,.]+)\s+([A-Z]{3})", text)
     if total_match:
         total_str, currency = total_match.groups()
-        data["total"] = float(total_str.replace(",", ""))
+        data["total"] = parse_number(total_str, fmt) or 0.0
         data["currency"] = currency
 
     # Extract Transport value
@@ -186,27 +254,22 @@ def extract_totals_and_incoterm(text):
     transport_match = re.search(transport_pattern, text)
     if transport_match:
         transport_str = transport_match.group(1)
-        transport_value = float(transport_str.replace(",", ""))
-        
+        transport_value = parse_number(transport_str, fmt) or 0.0
+
         # If transport value is 0.00, check the next line for actual value
         if transport_value == 0.00:
             # Find the position after the matched transport line
             match_end = transport_match.end()
             remaining_text = text[match_end:]
-            
+
             # Look for the next number (potentially with currency)
             next_value_match = re.search(r"\s+([\d,.]+)(?:\s+[A-Z]{3})?", remaining_text)
             if next_value_match:
-                next_value_str = next_value_match.group(1)
-                try:
-                    next_value = float(next_value_str.replace(",", ""))
-                    # Only use this value if it's a valid float and not 0
-                    if next_value > 0:
-                        data["transport"] = next_value
-                    else:
-                        data["transport"] = transport_value
-                except ValueError:
-                    # If can't convert to float, use original value
+                next_value = parse_number(next_value_match.group(1), fmt)
+                # Only use this value if it's a valid number and not 0
+                if next_value:
+                    data["transport"] = next_value
+                else:
                     data["transport"] = transport_value
             else:
                 data["transport"] = transport_value
@@ -272,6 +335,8 @@ def extract_customs_code(text_content):
 
 
 def extract_products_from_text(text):
+    """Parse product blocks from a page. Returns (results, dropped_product_codes)
+    so that silently missing items can be reported instead of vanishing."""
     lines = text.strip().splitlines()
     products = []
     current_block = []
@@ -287,9 +352,13 @@ def extract_products_from_text(text):
 
     if current_block:
         products.append(current_block)
-    
+
     results = []
+    dropped = []
     for block in products:
+        # not a product block (account numbers etc. also match ^\d{7}$) — skip silently
+        if not any("Customs Tariff" in line for line in block):
+            continue
         try:
             # 🧼 CLEAN unexpected lines
             expected_prefixes = [
@@ -301,7 +370,7 @@ def extract_products_from_text(text):
             for line in block[1:]:
                 if any(line.startswith(prefix) for prefix in expected_prefixes):
                     cleaned_block.append(line)
-                elif re.match(r"^[\d.,]+\s+[A-Z]{1,3}$", line):  # quantity/unit
+                elif re.match(r"^[\d.,]+\s+[A-Za-z]{1,3}$", line):  # quantity/unit — units can be lowercase (e.g. 'yd')
                     cleaned_block.append(line)
                 elif is_currency_amount(line):
                     cleaned_block.append(line)
@@ -310,8 +379,8 @@ def extract_products_from_text(text):
                 elif is_currency_only(line):
                     cleaned_block.append(line)
                 else:
-                    # Keep product name lines
-                    if not cleaned_block or cleaned_block == [block[0]]:
+                    # Keep product name lines (may wrap over two lines)
+                    if len(cleaned_block) <= 2 and not cleaned_block[-1].startswith("• Order"):
                         cleaned_block.append(line)
 
             # 🩹 FIX: merge stray product name lines if second line not starting with expected label
@@ -398,14 +467,37 @@ def extract_products_from_text(text):
                 surface = block[surface_idx].split(":", 1)[1].strip()
                 origin = block[origin_idx].split(":", 1)[1].strip()
                 
-                # Find quantity/unit line after origin
-                qty_idx = origin_idx + 1
-                if qty_idx < len(block) and re.match(r"^[\d.,]+\s+[A-Z]{1,3}$", block[qty_idx]):
-                    quantity, unit = block[qty_idx].split()
-                    unit_price = block[qty_idx + 1].strip() if qty_idx + 1 < len(block) else ""
-                    amount, currency = extract_amount_and_currency(block[qty_idx + 2:min(qty_idx + 4, len(block))])
-                else:
+                # Find the quantity line: number + unit where the unit is NOT a
+                # currency (units may be lowercase, e.g. '31.00 yd'); searching by
+                # shape instead of position survives extra/missing lines
+                qty_idx = None
+                for j in range(origin_idx + 1, len(block)):
+                    m = re.match(r"^([\d.,]+)\s+([A-Za-z]{1,3})\s*$", block[j])
+                    if m and m.group(2).upper() not in _CURRENCIES:
+                        qty_idx = j
+                        quantity, unit = m.group(1), m.group(2)
+                        break
+                if qty_idx is None:
                     raise ValueError("Cannot find quantity/unit in new format")
+
+                # After the quantity: unit price, optional discount %, amount, currency.
+                # e.g. ['42.11 USD', '1,305.33', 'USD']            (US layout)
+                #      ['336.00 USD', '40', '1,411.20', 'USD']     (with 40% discount)
+                #      ['70.88 EUR', '141.75 EUR']                 (EU layout)
+                values = []   # (number_string or None, currency or None)
+                for j in range(qty_idx + 1, len(block)):
+                    line = block[j].strip()
+                    m = re.match(r"^([\d.,]+)\s*([A-Za-z]{3,4})?$", line)
+                    if m:
+                        values.append((m.group(1), (m.group(2) or "").upper() or None))
+                    elif is_currency_only(line):
+                        values.append((None, line))
+                numeric = [v for v in values if v[0] is not None]
+                if not numeric:
+                    raise ValueError("No price/amount lines found in new format")
+                unit_price = numeric[0][0]
+                amount = numeric[-1][0] if len(numeric) > 1 else None
+                currency = next((c for _, c in reversed(values) if c), None)
 
             results.append({
                 "product_code": product_code,
@@ -425,9 +517,10 @@ def extract_products_from_text(text):
 
         except Exception as e:
             logging.error(f"Error processing block: {block}. Error: {e}")
+            dropped.append(block[0] if block else "?")
             continue
 
-    return results
+    return results, dropped
 
 
 def is_currency_amount(line):
@@ -461,12 +554,12 @@ def extract_amount_and_currency(amount_lines):
     first_line = amount_lines[0].strip()
     
     # Check if first line has amount + currency in one line
+    # NOTE: amounts are returned RAW — the document-level number format
+    # parser decides later whether commas/dots are thousands or decimals
     currency_match = re.search(r"^([\d.,]+)\s*([A-Z]{3,4})$", first_line)
     if currency_match:
-        amount = currency_match.group(1).replace(",", "")
-        currency = currency_match.group(2)
-        return amount, currency
-    
+        return currency_match.group(1), currency_match.group(2)
+
     # Check if it's split across two lines
     if len(amount_lines) >= 2:
         # First line: amount only
@@ -474,10 +567,8 @@ def extract_amount_and_currency(amount_lines):
             second_line = amount_lines[1].strip()
             # Second line: currency only
             if is_currency_only(second_line):
-                amount = first_line.replace(",", "")
-                currency = second_line
-                return amount, currency
-    
+                return first_line, second_line
+
     # If no clear pattern found, try to extract what we can
     # Look for any currency in the lines
     for line in amount_lines:
@@ -487,9 +578,8 @@ def extract_amount_and_currency(amount_lines):
             # Extract numbers from the same or previous lines
             amount_match = re.search(r"([\d.,]+)", line)
             if amount_match:
-                amount = amount_match.group(1).replace(",", "")
-                return amount, currency
-    
+                return amount_match.group(1), currency
+
     return None, None
 
 

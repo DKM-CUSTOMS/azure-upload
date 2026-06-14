@@ -3,6 +3,7 @@ import logging
 from bs4 import BeautifulSoup
 
 from global_db.countries.functions import get_abbreviation_by_country
+from global_db.functions.numbers.number_format import parse_number
 
 
 def merge_invoice_outputs(invoice_outputs):
@@ -92,10 +93,18 @@ def clean_invoice_items(combined_result):
 
     for item in combined_result.get("items", []):
         try:
-            TotalNetWeight += safe_float_conversion(item.get("net_weight", "0").replace("KG", "").strip())
-            TotalSurface += safe_float_conversion(item.get("surface", "0").replace("M2", "").strip())   
-            TotalQuantity += safe_int_conversion(safe_float_conversion(item.get("quantity", "0").strip()))
-            
+            # number format detected per source document (EU vs US separators)
+            fmt = item.pop("_fmt", "US")
+            net_weight = parse_number(str(item.get("net_weight") or "").replace("KG", "").strip(), fmt) or 0.0
+            surface = parse_number(str(item.get("surface") or "").replace("M2", "").strip(), fmt) or 0.0
+            quantity = int(round(parse_number(str(item.get("quantity") or "").strip(), fmt) or 0))
+            unit_price = parse_number(str(item.get("unit_price") or "").replace("EUR", "").replace("USD", "").strip(), fmt) or 0.0
+            amount = parse_number(str(item.get("amount") or "").replace("EUR", "").replace("USD", "").strip(), fmt) or 0.0
+
+            TotalNetWeight += net_weight
+            TotalSurface += surface
+            TotalQuantity += quantity
+
             cleaned_item = {
                 "product_code": item.get("product_code", "").strip(),
                 "product_name": item.get("product_name", "").strip(),
@@ -104,15 +113,14 @@ def clean_invoice_items(combined_result):
                 "customs_tariff": item.get("customs_tariff", "").strip(),
                 "origin": get_abbreviation_by_country(item.get("origin", "").strip()),
 
-                # Strip and convert
-                "net_weight": safe_float_conversion(item.get("net_weight", "0").replace("KG", "").strip()),
-                "surface": safe_float_conversion(item.get("surface", "0").replace("M2", "").strip()),
-                "quantity": safe_int_conversion(safe_float_conversion(item.get("quantity", "0").strip())),
+                "net_weight": net_weight,
+                "surface": surface,
+                "quantity": quantity,
                 "unit": item.get("unit", "").strip(),
 
-                "unit_price": safe_float_conversion(item.get("unit_price", "0").replace("EUR", "").strip()),
-                "amount": safe_float_conversion(item.get("amount", "0").replace("EUR", "").replace(",", "").strip()),
-                
+                "unit_price": unit_price,
+                "amount": amount,
+
                 "document_number": item.get("document_number", "").strip(),
                 "date": date,
             }
