@@ -303,7 +303,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     
     # Proceed with data processing
     try:
-        excel_file = write_to_excel(combined_result, warnings)
+        excel_file = write_to_excel(combined_result)
         reference = combined_result.get("header").get("document_number") or "document"
 
         # Set response headers for the Excel file download

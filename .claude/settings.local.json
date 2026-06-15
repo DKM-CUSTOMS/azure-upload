@@ -25,7 +25,8 @@
       "Bash(echo \"exit=$?\")",
       "Bash(python -m py_compile performanceV3/__init__.py)",
       "Bash(python3 -m py_compile performanceV3/__init__.py)",
-      "Bash(python -c \"import json; json.load\\(open\\('performanceV3/function.json'\\)\\); print\\('FUNCTION_JSON_OK'\\)\")"
+      "Bash(python -c \"import json; json.load\\(open\\('performanceV3/function.json'\\)\\); print\\('FUNCTION_JSON_OK'\\)\")",
+      "Bash(python -m py_compile VanPoppel_Arte/__init__.py VanPoppel_Arte/excel/create_excel.py VanPoppel_Soudal/__init__.py)"
     ]
   }
 }

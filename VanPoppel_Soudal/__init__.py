@@ -458,16 +458,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
         reference = merged_result.get("Reference", "document")
 
-        report_text = None
-        if validation_problems:
-            logging.warning(f"Validation warnings: {validation_problems}")
-            report_text = ("Validation warnings - please double-check these against the source documents:\n- "
-                           + "\n- ".join(validation_problems))
-
         if extra_file_excel is not None:
-            zip_file = zip_excels(None, extra_file_excel, None, f"extra_{reference}.xlsx", report_text)
+            zip_file = zip_excels(None, extra_file_excel, None, f"extra_{reference}.xlsx")
         else:
-            zip_file = zip_excels(excel_file, None, f"factuur_{reference}.xlsx", None, report_text)
+            zip_file = zip_excels(excel_file, None, f"factuur_{reference}.xlsx", None)
 
         headers = {
             'Content-Disposition': f'attachment; filename="{reference}.zip"',

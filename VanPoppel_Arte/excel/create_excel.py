@@ -3,7 +3,7 @@ import logging
 import openpyxl
 
 
-def write_to_excel(json_string, warnings=None):
+def write_to_excel(json_string):
     # Create a new workbook and select the active sheet
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -179,14 +179,6 @@ def write_to_excel(json_string, warnings=None):
                 pass
         adjusted_width = (max_length + 2)
         ws.column_dimensions[column].width = adjusted_width
-
-    # Validation warnings on a separate sheet so the main layout stays untouched
-    if warnings:
-        ws_warn = wb.create_sheet("Warnings")
-        ws_warn.append(["Validation warnings - please double-check against the source documents"])
-        for warning in warnings:
-            ws_warn.append([warning])
-        ws_warn.column_dimensions["A"].width = 120
 
     # Save the workbook to a BytesIO object (in memory)
     file_stream = BytesIO()
