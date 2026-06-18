@@ -73,7 +73,6 @@ def write_to_extra_excel(json_string):
         "Net Value",
         "Currency",
         "Comm. Code",
-        "Pieces",
         "Invoice number",
         "Invoice date",
     ]
