@@ -244,8 +244,21 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         result_dict["Total Value"] = 0.00
                         result_dict["Currency"] = ""
 
-                    if text_data.get("Total Pallets") and not result_dict.get("Total Pallets"):
-                        result_dict["Total Pallets"] = text_data["Total Pallets"]
+                    # The text layer parsing in soudal_pdf.py already uses a regex to find BOTH 'Pallet' and 'Drum' and sums them up.
+                    # AI only extracts 'Pallets' (38), but text layer extracts both (38+9=47).
+                    # Therefore, we should always prioritize the text layer's calculation if it exists.
+                    ai_pallets = result_dict.get("Total Pallets")
+                    text_pallets = text_data.get("Total Pallets")
+                    logging.error(f"DEBUG PALLETS -> AI extracted: {ai_pallets}, Text extracted (Pallets+Drums): {text_pallets}")
+                    
+                    if text_pallets:
+                        result_dict["Total Pallets"] = text_pallets
+                        logging.error(f"DEBUG PALLETS -> Final used value (from Text): {result_dict['Total Pallets']}")
+                    elif not result_dict.get("Total Pallets"):
+                        result_dict["Total Pallets"] = 0
+                        logging.error("DEBUG PALLETS -> Final used value (Fallback): 0")
+                    else:
+                        logging.error(f"DEBUG PALLETS -> Final used value (from AI): {result_dict['Total Pallets']}")
                     
                     container_number = result_dict.get("Container", "")
                     if container_number:
