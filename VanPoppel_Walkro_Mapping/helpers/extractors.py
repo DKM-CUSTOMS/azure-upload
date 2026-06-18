@@ -43,7 +43,7 @@ invoice_data = {
     "Address": {
         "Company name": "<name of the company>",
         "Street": "<street and number>",
-        "Postcode": "<postcode>",
+        "Postcode": "<postcode (MUST extract the 4-5 digit number like '5324' if it is next to the city)>",
         "City": "<city>",
         "Country": "<country code>"
     },
@@ -62,10 +62,10 @@ invoice_data = {
 
 Instructions:
 - VAT Exporter: Extract and normalize the VAT number (no spaces or dots).
-- Address: Extract Company name, street, postcode, city, and country (as ISO code).
+- Address: Extract Company name, street, postcode (CRITICAL: extract the numerical postcode like '5324' which is usually located next to or above the city), city, and country (as ISO code).
 - Transport fee: Extract transport fee if available
 - License plate: Kenteken/Pasnr.
-- Truck number: Truck number if available (always extract it from the first page) 
+- Truck number: Truck number if available (always extract it from the first page)
 - Items: Extract the commodity data:
   - Description: Commodity description
   - Net weight: Convert weight from ton to kg
@@ -74,12 +74,13 @@ Instructions:
   - Invoice date: From invoice date
   - Package: Package details
   - Date: Invoice date
-  
+
  Ensure that the extracted data strictly adheres to the JSON format provided above. Output only valid JSON. No additional commentary or explanation.
 """
     
     # Mistral call
     qa = MistralDocumentQA()
+    logging.error(f"====== PROMPT GIVEN TO AI FOR {filename} ======\n{prompt}\n==========================================")
     response = qa.ask_document(base64_pdf, prompt, filename=filename)
 
     # Clean response
