@@ -13,6 +13,7 @@ googletrans==4.0.2
 azure-ai-formrecognizer==3.3.3
 azure-keyvault-secrets==4.9.0
 azure-identity
+azure-ai-contentunderstanding==1.0.0b1
 cachetools==5.5.1
 azure-storage-blob==12.24.1
 openai==1.63.1
