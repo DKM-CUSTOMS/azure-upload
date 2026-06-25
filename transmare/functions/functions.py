@@ -5,8 +5,11 @@ from bs4 import BeautifulSoup
 
 
 def clean_incoterm(inco : str) -> list :
-    if inco is not None :
-        return inco.split(' ', maxsplit=1)
+    # Always return exactly [term, place] so callers can unpack safely,
+    # even when the AI returns no incoterm or one with no place (e.g. "EXW").
+    if inco:
+        parts = inco.split(' ', maxsplit=1)
+        return [parts[0], parts[1] if len(parts) > 1 else '']
     return ['', '']
 
 def clean_Origin(value : str) -> str :

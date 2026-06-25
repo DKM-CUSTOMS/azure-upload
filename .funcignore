@@ -10,5 +10,6 @@ test
 venv
 soudal_samples
 artesamples
+tools
 .claude
 memory

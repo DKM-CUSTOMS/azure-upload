@@ -323,17 +323,10 @@ def clean_invoice_result(result):
     parsed_result = parser.parse_address(address)
     result["Address"] = parsed_result
 
-    total = result.get("Total", "")
-    if total:
-        total = normalize_numbers(str(total))
-        total = safe_float_conversion(total)
-        result["Total"] = total
-
-    freight = result.get("Freight", "")
-    if freight:
-        valueF = normalize_numbers(str(freight))
-        valueF = safe_float_conversion(valueF)
-        result["Freight"] = valueF
+    # Always coerce summable fields to float so merging never hits str + float.
+    # Empty/missing values become 0.0 (parse_float_value handles all cases).
+    result["Total"] = parse_float_value(result.get("Total", 0))
+    result["Freight"] = parse_float_value(result.get("Freight", 0))
 
     items = result.get("Items", []) or []
     totalCollis = 0

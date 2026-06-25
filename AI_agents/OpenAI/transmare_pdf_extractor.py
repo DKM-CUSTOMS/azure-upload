@@ -201,6 +201,18 @@ class TransmarePDFExtractor:
             "fatura", "e-fatura", "sales invoice", "tax invoice",
             "order confirmation", "confirmation de commande",
         ]
+        # Real invoice document-type titles. A bare "invoice" substring is NOT
+        # here on purpose: carrier docs (booking confirmations) mention it too.
+        strong_invoice_titles = [
+            "commercial invoice", "proforma invoice", "proforma facture",
+            "facture proforma", "sales invoice", "tax invoice",
+            "factuur", "rechnung", "fatura", "e-fatura",
+        ]
+        # Carrier/transport document types that are never a commercial invoice.
+        decisive_non_invoice_titles = [
+            "booking confirmation", "bill of lading", "arrival notice",
+            "shipping instruction", "sea waybill",
+        ]
         invoice_fields = [
             "invoice no", "invoice number", "invoice date", "fatura no",
             "fatura tarihi", "vkn", "vat", "ettn", "total amount", "grand total",
@@ -218,9 +230,16 @@ class TransmarePDFExtractor:
         ]
 
         title_hits = [term for term in invoice_titles if term in normalized]
+        strong_title_hits = [term for term in strong_invoice_titles if term in normalized]
         field_hits = [term for term in invoice_fields if term in normalized]
         goods_hits = [term for term in goods_fields if term in normalized]
         negative_hits = [term for term in non_invoice_titles if term in normalized]
+        # Position of the earliest carrier-doc title vs the earliest real invoice
+        # title. The document's own type leads the page; references to other doc
+        # types appear later in the body. Comparing positions tells them apart even
+        # when a booking's fine print mentions "commercial invoice".
+        decisive_negative_pos = self._earliest_position(decisive_non_invoice_titles, normalized)
+        strong_title_pos = self._earliest_position(strong_invoice_titles, normalized)
         money_hits = len(re.findall(r"\b(?:eur|usd|gbp|try|mad|dkk|sek|nok|chf)\b|[$]", normalized))
         hs_hits = len(re.findall(r"\b\d{8,12}\b", normalized))
 
@@ -237,6 +256,24 @@ class TransmarePDFExtractor:
         if negative_hits:
             blockers.append(f"non-invoice terms: {', '.join(negative_hits[:4])}")
 
+        # A document led by a carrier/transport title (booking confirmation, B/L,
+        # ...) ahead of any real invoice title is decisively not an invoice,
+        # regardless of how many goods/currency/HS markers it carries.
+        if decisive_negative_pos is not None and (
+            strong_title_pos is None or decisive_negative_pos < strong_title_pos
+        ):
+            leading = [
+                term for term in decisive_non_invoice_titles
+                if normalized.find(term) == decisive_negative_pos
+            ]
+            return {
+                "decision": "non_invoice",
+                "confidence": 0.92,
+                "filename": filename,
+                "reasons": reasons,
+                "blockers": blockers or [f"non-invoice document type: {', '.join(leading[:4])}"],
+            }
+
         score = (
             min(len(title_hits), 2) * 35
             + min(len(field_hits), 4) * 10
@@ -244,7 +281,9 @@ class TransmarePDFExtractor:
             + min(money_hits, 4) * 4
             + min(hs_hits, 4) * 5
         )
-        if negative_hits and not title_hits:
+        # Subtract for non-invoice markers unless a real invoice title is present;
+        # a bare "invoice" substring must not buy immunity from this penalty.
+        if negative_hits and not strong_title_hits:
             score -= min(len(negative_hits), 3) * 20
 
         if score >= 65 and title_hits and (field_hits or goods_hits or money_hits):
@@ -532,3 +571,7 @@ Repair rules:
 
     def _normalize_text(self, text):
         return re.sub(r"\s+", " ", (text or "").lower())
+
+    def _earliest_position(self, terms, normalized):
+        positions = [normalized.find(term) for term in terms if term in normalized]
+        return min(positions) if positions else None
