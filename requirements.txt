@@ -17,7 +17,6 @@ azure-ai-contentunderstanding==1.0.0b1
 cachetools==5.5.1
 azure-storage-blob==12.24.1
 openai==1.63.1
-asyncio==3.4.3
 aiohttp==3.11.16
 xlrd==1.2.0
 mistralai==1.7.0
