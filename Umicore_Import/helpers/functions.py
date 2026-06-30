@@ -21,7 +21,11 @@ def merge_into_items(first_json_str, second_json_str):
     # Iterate through each item in the first JSON's Items array
     for item in first_data.get("Items", []):
         other_ref = str(item.get("other_reference", ""))
-        original_value = item.get("invoice_value", 0)
+        # Coerce invoice_value to a float; OpenAI may return null (None) or a string
+        try:
+            original_value = float(item.get("invoice_value") or 0)
+        except (ValueError, TypeError):
+            original_value = 0.0
         
         # If matching contract_numbers exist, create a new entry for each match
         if other_ref in contract_to_data_list:

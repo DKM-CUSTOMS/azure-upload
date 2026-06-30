@@ -29,6 +29,17 @@ MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2  # seconds
 MAX_CONCURRENCY = 3  # Maximum number of concurrent API calls
 
+def clean_c670(value):
+    """Return only the C670 code, stripping any leading 'Bijlage' annex prefix.
+
+    The model occasionally returns e.g. 'Bijlage VII-C672' instead of 'VII-C672'.
+    """
+    if not isinstance(value, str):
+        return value
+    # Remove a leading 'Bijlage' (case-insensitive) and any following separators/spaces
+    cleaned = re.sub(r'^\s*bijlage\b[\s:.-]*', '', value, flags=re.IGNORECASE)
+    return cleaned.strip()
+
 def is_pdf(filename):
     """Check if file is PDF based on extension"""
     return filename.lower().endswith('.pdf')
@@ -135,7 +146,7 @@ async def process_page_with_openai_a(client, text_content, page_num, total_pages
                 - **Vak 37**: Extract and return as is (e.g., "4500").
                 - **Vak 44**: Extract and return as is (e.g., "BEVALA00011").
                 - **cost center**: Extract and return as is (e.g., "HBN5046").
-                - **C670**: Extract the code found after "Afvalstoffenreglementering" at the bottom of the page. Only return the code or number (e.g., "BE001014800", "VII-C672", "CA715086", "OVAM-Y923"). If "GEEN" is found, return "Geen".
+                - **C670**: Extract the code found after "Afvalstoffenreglementering" at the bottom of the page. Only return the code or number itself, WITHOUT any leading word like "Bijlage" (e.g., return "VII-C672", not "Bijlage VII-C672"). Examples: "BE001014800", "VII-C672", "CA715086", "OVAM-Y923". If "GEEN" is found, return "Geen".
                 
 
                 ### **JSON Output Format:**  
@@ -175,12 +186,18 @@ async def process_page_with_openai_a(client, text_content, page_num, total_pages
         
         # Parse the JSON content
         page_data = json.loads(result)
-        
+
+        # Normalize C670: keep only the code, drop any 'Bijlage' prefix
+        if isinstance(page_data, dict) and "C670" in page_data:
+            page_data["C670"] = clean_c670(page_data["C670"])
+
+        logger.info(f"Inklaringsdocument page {page_num + 1} extracted: {json.dumps(page_data, indent=2)}")
+
         return {
             "page_number": page_num + 1,
             "extracted_data": page_data
         }
-        
+
     except json.JSONDecodeError as e:
         logger.error(f"JSON parsing error on page {page_num + 1}: {str(e)}")
         logger.error(f"Raw content: {result}")
@@ -446,11 +463,17 @@ async def main_async(req: func.HttpRequest) -> func.HttpResponse:
         result = merge_into_items(inklaringsdocument_data, afschrijfgegevens_data)
         logging.error(json.dumps(result, indent=2))
         
-        # Calculate totals
-        result["Total packages"] = sum(item.get("packages", 0) for item in result.get("Items", []))
-        result["Total gross"] = sum(item.get("gross_weight", 0) for item in result.get("Items", []))
-        result["Total net"] = sum(item.get("net_weight", 0) for item in result.get("Items", []))
-        result["Total Value"] = sum(item.get("invoice_value", 0) for item in result.get("Items", []))
+        # Calculate totals (guard against None values returned by the model)
+        def _num(value):
+            try:
+                return float(value or 0)
+            except (ValueError, TypeError):
+                return 0.0
+
+        result["Total packages"] = sum(_num(item.get("packages")) for item in result.get("Items", []))
+        result["Total gross"] = sum(_num(item.get("gross_weight")) for item in result.get("Items", []))
+        result["Total net"] = sum(_num(item.get("net_weight")) for item in result.get("Items", []))
+        result["Total Value"] = sum(_num(item.get("invoice_value")) for item in result.get("Items", []))
         
         try:
             # Get the ILS number
